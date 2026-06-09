@@ -1,12 +1,9 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { onAuthStateChanged, User, signOut, onIdTokenChanged } from 'firebase/auth';
-import { doc, getDoc, onSnapshot, updateDoc, serverTimestamp } from 'firebase/firestore';
-import { auth, db } from '../lib/firebase';
-import { handleFirestoreError, OperationType, removeUndefined } from '../lib/firestoreUtils';
+import { supabase, mapUserRow, UserRow } from '../lib/supabase';
 import { UserProfile } from '../types';
 
 interface AuthContextType {
-  user: User | null;
+  user: { uid: string; email: string | null } | null;
   profile: UserProfile | null;
   loading: boolean;
   logout: () => Promise<void>;
@@ -15,7 +12,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<{ uid: string; email: string | null } | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -25,22 +22,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const updateHeartbeat = async () => {
       try {
-        await updateDoc(doc(db, 'users', user.uid), removeUndefined({
-          lastSeen: serverTimestamp()
-        }));
-      } catch (e: any) {
-        // If the document doesn't exist yet, it's fine, we'll try again next interval
-        if (e.code !== 'not-found') {
-          console.error("Heartbeat failed", e);
-        }
+        await supabase
+          .from('users')
+          .update({ last_seen: new Date().toISOString() })
+          .eq('id', user.uid);
+      } catch (e) {
+        console.error("Heartbeat failed", e);
       }
     };
 
-    // Initial delay or check could be added, but immediately calling is fine if we ignore not-found
     const interval = setInterval(updateHeartbeat, 300000); // 5 minutes
-    
-    // We don't call immediately to let the initial profile creation happen if needed
-    // or we can call it after a short delay
     const initialTimeout = setTimeout(updateHeartbeat, 5000);
 
     return () => {
@@ -49,39 +40,57 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [user?.uid]);
 
+  // Subscribe to auth state changes
   useEffect(() => {
-    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
-      setUser(firebaseUser);
-      if (firebaseUser) {
-        // Initial profile fetch
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session?.user) {
+        setUser({ uid: session.user.id, email: session.user.email });
+
+        // Fetch profile
         try {
-          // Increase timeout to wait for SDK readiness
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          const docRef = doc(db, 'users', firebaseUser.uid);
-          const docSnap = await getDoc(docRef);
-          if (docSnap.exists()) {
-            const data = docSnap.data() as UserProfile;
-            setProfile({ ...data, uid: firebaseUser.uid });
+          const { data, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', session.user.id)
+            .single();
+
+          if (data && !error) {
+            setProfile(mapUserRow(data as UserRow));
           }
-        } catch (err: any) {
-          // Gracefully handle transient offline errors, 
-          // as onSnapshot will handle real-time sync immediately after
-          if (err?.message?.includes('offline')) {
-            console.warn("Firestore client temporarily offline during init, relying on onSnapshot.");
-          } else {
-            handleFirestoreError(err, OperationType.GET, `users/${firebaseUser.uid}`);
-          }
+        } catch (err) {
+          console.error("Error fetching profile:", err);
         }
       } else {
+        setUser(null);
         setProfile(null);
       }
       setLoading(false);
     });
 
-    return () => unsubscribeAuth();
+    // Check initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        setUser({ uid: session.user.id, email: session.user.email });
+        supabase
+          .from('users')
+          .select('*')
+          .eq('id', session.user.id)
+          .single()
+          .then(({ data, error }) => {
+            if (data && !error) {
+              setProfile(mapUserRow(data as UserRow));
+            }
+            setLoading(false);
+          });
+      } else {
+        setLoading(false);
+      }
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  // Listen for profile changes (including concurrent session checks)
+  // Poll for profile changes
   useEffect(() => {
     if (!user) return;
 
@@ -91,31 +100,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       sessionStorage.setItem('sessionId', newId);
     }
 
-    const unsubscribeProfile = onSnapshot(doc(db, 'users', user.uid), 
-      (doc) => {
-        if (doc.exists()) {
-          const data = doc.data() as UserProfile;
-          const updatedProfile = { ...data, uid: user.uid };
-          setProfile(updatedProfile);
+    const fetchProfile = async () => {
+      const { data } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', user.uid)
+        .single();
 
-    // Concurrent session check (Allow multiple devices)
-    const storedSessionId = sessionStorage.getItem('sessionId');
-    const activeSessions = data.sessionIds || (data.sessionId ? [data.sessionId] : []);
-    
-    if (activeSessions.length > 0 && storedSessionId && !activeSessions.includes(storedSessionId)) {
-      // Logic for multi-device support: Just ensure the current session is registered eventually
-      // We removed the warning to respect the user's preference for multi-device usage.
-    }
-        }
-      },
-      (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}`)
-    );
+      if (data) {
+        setProfile(mapUserRow(data as UserRow));
+      }
+    };
 
-    return () => unsubscribeProfile();
+    const interval = setInterval(fetchProfile, 10000); // Poll every 10 seconds
+
+    return () => clearInterval(interval);
   }, [user]);
 
   const logout = async () => {
-    await signOut(auth);
+    await supabase.auth.signOut();
   };
 
   return (

@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { doc, getDoc, setDoc, serverTimestamp, updateDoc, arrayUnion, increment } from 'firebase/firestore';
-import { db } from '../lib/firebase';
-import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { supabase, mapExamRow, mapSubmissionRow, ExamRow, SubmissionRow } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { Exam, Submission, SubmissionResponse, ExamSection } from '../types';
 import { calculateSubmissionScore } from '../lib/scoreUtils';
@@ -12,20 +10,7 @@ import {
   TextRun,
   HeadingLevel
 } from 'docx';
-import { 
-  Timer, 
-  ChevronLeft, 
-  ChevronRight, 
-  AlertTriangle,
-  Maximize2,
-  BrainCircuit,
-  Loader2,
-  ShieldCheck,
-  Zap,
-  CheckCircle2,
-  Bookmark,
-  FileDown
-} from 'lucide-react';
+import { Timer, ChevronLeft, ChevronRight, TriangleAlert as AlertTriangle, Maximize2, BrainCircuit, Loader as Loader2, ShieldCheck, Zap, CircleCheck as CheckCircle2, Bookmark, FileDown } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -40,7 +25,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
   const [loading, setLoading] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [activeSection, setActiveSection] = useState<'Maths' | 'Physics' | 'Chemistry'>('Maths');
-  const [activeQuestionIdx, setActiveQuestionIdx] = useState(0); 
+  const [activeQuestionIdx, setActiveQuestionIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<string, SubmissionResponse>>({});
   const [sectionTimeSpent, setSectionTimeSpent] = useState<Record<string, number>>({});
   const [timeLeft, setTimeLeft] = useState(3 * 60 * 60);
@@ -53,7 +38,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
   const [holdProgress, setHoldProgress] = useState(0);
   const holdIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const lastInteractionTimeRef = useRef<number>(Date.now());
-  
+
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -93,22 +78,37 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         const context = canvasRef.current.getContext('2d');
         if (context) {
           context.drawImage(videoRef.current, 0, 0, 240, 180);
-          // High compression (0.3) to keep document size under 1MB even after many snapshots
           const photo = canvasRef.current.toDataURL('image/jpeg', 0.3);
-          
+
           if (!profile?.uid) return;
           const subId = `${profile.uid}_${examId}`;
-          setDoc(doc(db, 'submissions', subId), {
-            userId: profile.uid,
-            examId: examId,
-            userName: profile.role === 'admin' ? 'Admin Testing' : profile.displayName,
-            status: 'started',
-            integrityPhotos: arrayUnion(photo),
-            updatedAt: serverTimestamp()
-          }, { merge: true }).catch(e => console.error('PHOTO_SYNC_FAILURE', e));
+
+          (async () => {
+            try {
+              // Fetch existing photos
+              const { data: existing } = await supabase
+                .from('submissions')
+                .select('integrity_photos')
+                .eq('id', subId)
+                .single();
+
+              const currentPhotos = existing?.integrity_photos || [];
+              currentPhotos.push(photo);
+
+              await supabase
+                .from('submissions')
+                .update({
+                  integrity_photos: currentPhotos.slice(-20), // Keep last 20 photos
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', subId);
+            } catch (e) {
+              console.error('PHOTO_SYNC_FAILURE', e);
+            }
+          })();
         }
       }
-    }, 10 * 60 * 1000); // Increased interval to 10 minutes to save quota and document space
+    }, 10 * 60 * 1000);
 
     return () => {
       clearInterval(snapshotInterval);
@@ -138,84 +138,76 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
   useEffect(() => {
     const fetchExam = async () => {
       const targetExamId = examId?.trim();
-      
-      // Ensure we have a profile UID before proceeding, but also ensure we don't stay stuck
+
       if (!profile?.uid) {
         console.warn('INIT_SEQ: DEFERRED. Profile UID not found yet.');
-        // Don't set loading(false) yet, we expect profile to arrive soon
-        return; 
+        return;
       }
 
       console.log('INIT_SEQ: Starting fetch for targetExamId:', targetExamId, 'for profile:', profile.uid);
       setLoading(true);
-      
+
       const timeout = setTimeout(() => {
         setLoading(false);
-      }, 8000); // 8s safety timeout
+      }, 8000);
 
       try {
         if (!targetExamId) throw new Error('Exam ID is missing');
-        const docRef = doc(db, 'exams', targetExamId);
-        
-        // Use try-catch specifically for the exam fetch to provide better error context
-        let docSnap;
-        try {
-          docSnap = await getDoc(docRef);
-        } catch (getErr) {
-          console.error("EXAM_FETCH_FAILURE:", getErr);
-          handleFirestoreError(getErr, OperationType.GET, `exams/${targetExamId}`);
+
+        // Fetch exam
+        const { data: examData, error: examError } = await supabase
+          .from('exams')
+          .select('*')
+          .eq('id', targetExamId)
+          .single();
+
+        if (examError || !examData) {
+          console.error("EXAM_FETCH_FAILURE:", examError);
           return;
         }
-        
-        if (docSnap && docSnap.exists()) {
-          const examData = { id: docSnap.id, ...docSnap.data() } as Exam;
-          setExam(examData);
-          setTimeLeft(Number(examData.duration) > 0 ? Number(examData.duration) * 60 : 180 * 60);
 
-          const subId = `${profile.uid}_${targetExamId}`;
-          console.log('INIT_SEQ: Synchronizing Submission State [ID: ' + subId + ']');
-          
-          let subSnap;
-          try {
-            subSnap = await getDoc(doc(db, 'submissions', subId));
-          } catch (subGetErr) {
-            console.error("SUB_FETCH_FAILURE:", subGetErr);
-            handleFirestoreError(subGetErr, OperationType.GET, `submissions/${subId}`);
+        const examObj = mapExamRow(examData as ExamRow);
+        examObj.id = targetExamId;
+        setExam(examObj);
+        setTimeLeft(Number(examObj.duration) > 0 ? Number(examObj.duration) * 60 : 180 * 60);
+
+        const subId = `${profile.uid}_${targetExamId}`;
+        console.log('INIT_SEQ: Synchronizing Submission State [ID: ' + subId + ']');
+
+        // Fetch submission
+        const { data: subData, error: subError } = await supabase
+          .from('submissions')
+          .select('*')
+          .eq('id', subId)
+          .single();
+
+        if (subData && !subError) {
+          const subObj = mapSubmissionRow(subData as SubmissionRow);
+          if (subObj.status === 'completed') {
+            console.log('INIT_SEQ: Submission Archive Found. Enforcing Single-Attempt lock.');
+            setHoldProgress(-1);
+            setLoading(false);
             return;
-          }
-          
-          if (subSnap && subSnap.exists()) {
-            const subData = { id: subSnap.id, ...subSnap.data() } as Submission;
-            if (subData.status === 'completed') {
-              console.log('INIT_SEQ: Submission Archive Found. Enforcing Single-Attempt lock.');
-              setHoldProgress(-1); // Signal attempt limit exceeded
-              setLoading(false);
-              return;
-            } else {
-              console.log('INIT_SEQ: Active Session Found. Answers count:', Object.keys(subData.answers || {}).length);
-              setAnswers(subData.answers || {});
-            }
           } else {
-            console.log('INIT_SEQ: No Session Record. Initializing new archival node at /submissions/' + subId);
-            await setDoc(doc(db, 'submissions', subId), {
-              userId: profile.uid,
-              userName: profile.displayName,
-              examId: targetExamId,
+            console.log('INIT_SEQ: Active Session Found. Answers count:', Object.keys(subObj.answers || {}).length);
+            setAnswers(subObj.answers || {});
+          }
+        } else {
+          console.log('INIT_SEQ: No Session Record. Initializing new archival node at /submissions/' + subId);
+          await supabase
+            .from('submissions')
+            .insert({
+              id: subId,
+              user_id: profile.uid,
+              user_name: profile.displayName,
+              exam_id: targetExamId,
               status: 'started',
               answers: {},
               score: 0,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp()
             });
-          }
-        } else {
-          console.error('INIT_SEQ: DATA_REJECTION. Document not found at exams/' + targetExamId);
         }
       } catch (err) {
         console.error('INIT_SEQ: CRITICAL_SYNC_FAILURE:', err);
-        try {
-          handleFirestoreError(err, OperationType.GET, `exams/${targetExamId}`);
-        } catch (e) {}
       } finally {
         clearTimeout(timeout);
         setLoading(false);
@@ -234,7 +226,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
 
   const handleSubmit = useCallback(async () => {
     if (!exam || !profile || isSubmitting) return;
-    
+
     setIsSubmitting(true);
     console.log('TRANS_SEQ: Initiating final aggregation.');
 
@@ -242,7 +234,6 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
       const results = calculateSubmissionScore(exam, { answers } as any);
       const { score, correct: cCount, incorrect: incCount, skipped: skCount } = results;
 
-      // Update local state IMMEDIATELY for perception of speed
       setFinalScore(score);
       setStats({ correct: cCount, incorrect: incCount, skipped: skCount });
 
@@ -250,50 +241,56 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         try { await document.exitFullscreen(); } catch (e) {}
       }
 
-      // Transition to result screen immediately
       setIsSubmitting(false);
       setShowResult(true);
 
       const subId = `${profile.uid}_${examId}`;
-      
-      // Perform Firestore update in background
-      await setDoc(doc(db, 'submissions', subId), {
-        userId: profile.uid,
-        userName: profile.role === 'admin' ? 'Admin Testing' : profile.displayName,
-        examId: examId,
-        answers,
-        score,
-        calculatedScore: score,
-        correctCount: cCount,
-        incorrectCount: incCount,
-        skippedCount: skCount,
-        status: 'completed',
-        submittedAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      }, { merge: true });
-      
-      await updateDoc(doc(db, 'exams', examId), {
-        submissionCount: increment(1)
-      });
+
+      // Update submission
+      await supabase
+        .from('submissions')
+        .update({
+          user_id: profile.uid,
+          user_name: profile.role === 'admin' ? 'Admin Testing' : profile.displayName,
+          exam_id: examId,
+          answers,
+          score,
+          calculated_score: score,
+          correct_count: cCount,
+          incorrect_count: incCount,
+          skipped_count: skCount,
+          status: 'completed',
+          submitted_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', subId);
+
+      // Increment submission count
+      const { data: examData } = await supabase
+        .from('exams')
+        .select('submission_count')
+        .eq('id', examId)
+        .single();
+
+      if (examData) {
+        await supabase
+          .from('exams')
+          .update({ submission_count: (examData.submission_count || 0) + 1 })
+          .eq('id', examId);
+      }
     } catch (error) {
       console.error('TRANS_SEQ: CRITICAL_FAILURE:', error);
       alert('TRANSMISSION DELAY: Your session data has been calculated locally, but the sync with the central server failed. Your result is being shown, but please contact the administrator to verify the sync. Error: ' + (error instanceof Error ? error.message : String(error)));
-      
-      // Still show result even if sync failed (we have the stats in state)
+
       setIsSubmitting(false);
       setShowResult(true);
-
-      try {
-        handleFirestoreError(error, OperationType.UPDATE, `submissions/${profile.uid}_${examId}`);
-      } catch (e) {}
     }
   }, [exam, profile, answers, examId, isSubmitting]);
 
   useEffect(() => {
     const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.innerWidth < 768;
-    
+
     const handleSecurityViolation = (event?: any) => {
-      // Disable aggressive blur/visibility checks on mobile as they are unreliable in mobile browser environments
       if (isMobile) return;
 
       if (isFullscreen && !isSubmitting && !showResult) {
@@ -376,7 +373,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
 
   useEffect(() => {
     if (loading || !exam || showResult || isSubmitting) return;
-    
+
     timerRef.current = setInterval(() => {
       setTimeLeft(prev => {
         if (prev <= 1) {
@@ -387,7 +384,6 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         return prev - 1;
       });
 
-      // Increment time spent on current question and section
       if (currentQuestion) {
         setAnswers(prev => {
           const qId = currentQuestion.id;
@@ -423,26 +419,26 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
       if (!exam || !profile?.uid) return;
       const subId = `${profile.uid}_${exam.id}`;
       try {
-        await setDoc(doc(db, 'submissions', subId), {
-          userId: profile.uid,
-          userName: profile.displayName,
-          examId: exam.id,
-          currentQuestionIndex: activeQuestionIdx,
-          currentSection: activeSection,
-          lastHeartbeat: serverTimestamp(),
-          status: 'started',
-          updatedAt: serverTimestamp()
-        }, { merge: true });
+        await supabase
+          .from('submissions')
+          .update({
+            user_id: profile.uid,
+            user_name: profile.displayName,
+            exam_id: exam.id,
+            current_question_index: activeQuestionIdx,
+            current_section: activeSection,
+            last_heartbeat: new Date().toISOString(),
+            status: 'in-progress',
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', subId);
         console.log('LIVE_SYNC: Heartbeat Dispatched');
       } catch (e) {
         console.warn("LIVE_SYNC: Heartbeat failed", e);
       }
     };
 
-    // Initial sync
     updateLiveStatus();
-
-    // Regular heartbeat every 30 seconds
     syncInterval = setInterval(updateLiveStatus, 30000);
 
     return () => {
@@ -463,12 +459,15 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
     if (!profile || !exam) return;
     try {
       const subId = `${profile.uid}_${examId}`;
-      await setDoc(doc(db, 'submissions', subId), {
-        userId: profile.uid,
-        userName: profile.displayName,
-        answers: currentAnswers,
-        updatedAt: serverTimestamp()
-      }, { merge: true });
+      await supabase
+        .from('submissions')
+        .update({
+          user_id: profile.uid,
+          user_name: profile.displayName,
+          answers: currentAnswers,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', subId);
     } catch (error) {
       console.error('Error saving progress:', error);
     }
@@ -531,14 +530,14 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 sm:p-12 text-white relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,rgba(37,99,235,0.1)_0%,transparent_70%)]" />
-        
-        <motion.div 
+
+        <motion.div
           variants={containerVariants}
           initial="hidden"
           animate="visible"
           className="relative z-10 w-full max-w-4xl bg-white/5 border border-white/10 rounded-[48px] backdrop-blur-xl p-12 sm:p-20 text-center shadow-2xl"
         >
-          <motion.div 
+          <motion.div
             variants={itemVariants}
             className="w-24 h-24 bg-blue-600 rounded-3xl flex items-center justify-center text-white mx-auto mb-10 shadow-2xl shadow-blue-600/30"
           >
@@ -569,9 +568,9 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
             </motion.div>
           </div>
 
-          <motion.button 
+          <motion.button
             variants={itemVariants}
-            onClick={() => onExit()} // Return to main page
+            onClick={() => onExit()}
             className="group relative bg-white text-slate-950 px-12 py-6 rounded-3xl font-black text-xl uppercase tracking-widest transition-all hover:-translate-y-2 active:translate-y-0"
           >
             <span className="relative z-10 flex items-center gap-4">
@@ -594,7 +593,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         <p className="text-slate-400 font-bold uppercase tracking-widest text-xs mb-12 max-w-lg mx-auto">
           Security Protocol Violation: You have already completed this assessment cycle. Multiple initialization attempts are strictly forbidden by the Central Nexus.
         </p>
-        <button 
+        <button
           onClick={onExit}
           className="bg-white text-slate-950 px-12 py-6 rounded-3xl font-black text-xl uppercase tracking-widest transition-all hover:bg-blue-600 hover:text-white"
         >
@@ -626,13 +625,13 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
           TIMESTAMP: {new Date().toISOString()}
         </div>
         <div className="flex gap-4">
-          <button 
+          <button
             onClick={() => window.location.reload()}
             className="bg-blue-600 text-white px-8 py-4 rounded-2xl font-black uppercase tracking-widest hover:bg-blue-700 transition-all shadow-xl shadow-blue-500/20"
           >
             Retry Sync
           </button>
-          <button 
+          <button
             onClick={onExit}
             className="bg-white/10 text-white px-8 py-4 rounded-2xl font-black uppercase tracking-widest hover:bg-white/20 transition-all border border-white/10"
           >
@@ -647,8 +646,8 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
     return (
       <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-12 text-white relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,rgba(37,99,235,0.1)_0%,transparent_70%)]" />
-        
-        <motion.div 
+
+        <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           className="relative z-10 w-full max-w-4xl text-center"
@@ -661,7 +660,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
           <h1 className="text-8xl font-black italic tracking-tighter uppercase leading-none mb-8">
             Secure <span className="text-blue-600">Terminal</span> Access
           </h1>
-          
+
           <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-16 text-left">
             {[
               { icon: <Timer />, label: 'Temporal Limit', val: '180:00:00' },
@@ -688,14 +687,14 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
             </div>
           </div>
 
-          <button 
+          <button
             onClick={onExit}
             className="mb-8 flex items-center justify-center gap-2 text-slate-500 hover:text-white font-black uppercase tracking-widest transition-all text-sm"
           >
             <ChevronLeft size={20} /> Return to Hub
           </button>
 
-          <button 
+          <button
             onClick={enterFullscreen}
             className="group relative bg-white text-slate-950 px-12 py-6 rounded-3xl font-black text-2xl uppercase tracking-widest transition-all hover:-translate-y-2 active:translate-y-0"
           >
@@ -713,16 +712,16 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
     <div className="h-screen bg-slate-50 flex flex-col overflow-hidden select-none font-sans">
       <AnimatePresence>
         {isSubmitting && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-[100] bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center space-y-8"
           >
-            <motion.div 
-              animate={{ rotate: 360 }} 
-              transition={{ repeat: Infinity, duration: 2, ease: "linear" }} 
-              className="w-24 h-24 border-t-4 border-blue-600 rounded-full shadow-[0_0_50px_rgba(37,99,235,0.3)]" 
+            <motion.div
+              animate={{ rotate: 360 }}
+              transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+              className="w-24 h-24 border-t-4 border-blue-600 rounded-full shadow-[0_0_50px_rgba(37,99,235,0.3)]"
             />
             <div className="text-center">
               <h2 className="text-xl font-black text-white uppercase tracking-[0.5em] mb-2">Finalizing Aggregates</h2>
@@ -736,7 +735,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
       <header className="h-14 md:h-24 bg-slate-950 text-white px-3 md:px-10 flex justify-between items-center shrink-0 z-[60]">
         <div className="flex items-center gap-2 md:gap-12">
           {/* Mobile Sidebar Toggle */}
-          <button 
+          <button
             onClick={() => setShowMobileSidebar(!showMobileSidebar)}
             className="lg:hidden p-2 bg-slate-900 rounded-lg border border-slate-800 text-blue-500"
           >
@@ -747,7 +746,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
             <h1 className="text-[10px] md:text-base font-black tracking-tighter uppercase italic leading-none truncate max-w-[80px] md:max-w-none">{exam.title}</h1>
             <span className="text-[8px] md:text-[10px] font-bold text-blue-500 uppercase tracking-[0.2em] mt-1 hidden sm:inline">Secure Terminal Interface</span>
           </div>
-          
+
           <div className="flex gap-1 md:gap-2">
             {(['Maths', 'Physics', 'Chemistry'] as const).map(s => (
               <button
@@ -779,8 +778,8 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                Critical Time: {Math.ceil(timeLeft/60)}m
              </div>
           )}
-          
-          <button 
+
+          <button
              onClick={downloadWordDoc}
              className="bg-purple-600 hover:bg-purple-700 h-8 md:h-14 px-3 md:px-6 rounded-lg md:rounded-2xl font-black text-[8px] md:text-sm uppercase tracking-widest shadow-xl shadow-purple-600/20 transition-all text-white flex items-center gap-2"
            >
@@ -788,7 +787,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
              <span className="hidden md:inline">DOWNLOAD WORD</span>
            </button>
 
-          <button 
+          <button
             onClick={() => setShowConfirmModal(true)}
             className="bg-blue-600 hover:bg-blue-700 h-8 md:h-14 px-3 md:px-10 rounded-lg md:rounded-2xl font-black text-[8px] md:text-sm uppercase tracking-widest shadow-xl shadow-blue-600/20 transition-all"
           >
@@ -802,13 +801,13 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
       {/* Confirmation Modal */}
       <AnimatePresence>
         {showConfirmModal && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-[110] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center p-6"
           >
-            <motion.div 
+            <motion.div
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.9, y: 20 }}
@@ -821,14 +820,14 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
               <div className="w-20 h-20 bg-red-500/10 rounded-3xl flex items-center justify-center text-red-600 mx-auto mb-8">
                 <AlertTriangle size={40} />
               </div>
-              
+
               <h3 className="text-3xl font-black text-slate-900 uppercase tracking-tight mb-4 italic">Confirm Archival?</h3>
               <p className="text-slate-500 font-bold uppercase tracking-widest text-xs mb-12 leading-relaxed">
                 You are about to transmit all saved aggregates to the central nexus. This will terminate your session and freeze your inputs permanently.
               </p>
 
               <div className="space-y-4">
-                <button 
+                <button
                   onMouseDown={() => {
                     holdIntervalRef.current = setInterval(() => {
                       setHoldProgress(p => {
@@ -862,8 +861,8 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                   <span className="relative z-10">HOLD TO TRANSMIT</span>
                   <div className="absolute inset-0 bg-blue-600 origin-left" style={{ transform: `scaleX(${holdProgress / 100})` }} />
                 </button>
-                
-                <button 
+
+                <button
                   onClick={() => { setShowConfirmModal(false); setHoldProgress(0); }}
                   className="w-full bg-slate-100 text-slate-400 py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-slate-200 hover:text-slate-600 transition-all"
                 >
@@ -880,7 +879,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         {/* Question Area */}
         <div className="flex-1 overflow-y-auto p-3 md:p-20 bg-white relative">
           <AnimatePresence mode="wait">
-            <motion.div 
+            <motion.div
               key={`${activeSection}-${activeQuestionIdx}`}
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
@@ -907,12 +906,12 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                 {((currentQuestion.imageUrls && currentQuestion.imageUrls.length > 0) ? currentQuestion.imageUrls : (currentQuestion.imageUrl ? [currentQuestion.imageUrl] : [])).length > 0 && (
                   <div className="mt-4 md:mt-8 flex flex-col gap-4">
                     {((currentQuestion.imageUrls && currentQuestion.imageUrls.length > 0) ? currentQuestion.imageUrls : [currentQuestion.imageUrl]).filter(Boolean).map((url: string, imgIdx: number) => (
-                      <img 
+                      <img
                         key={imgIdx}
-                        src={url} 
-                        alt={`Question Attachment ${imgIdx + 1}`} 
+                        src={url}
+                        alt={`Question Attachment ${imgIdx + 1}`}
                         referrerPolicy="no-referrer"
-                        className="max-w-full h-auto rounded-xl md:rounded-2xl border border-slate-200 shadow-sm" 
+                        className="max-w-full h-auto rounded-xl md:rounded-2xl border border-slate-200 shadow-sm"
                       />
                     ))}
                   </div>
@@ -930,8 +929,8 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                         onClick={() => handleAnswerSelect(label)}
                         className={cn(
                           "flex items-center gap-3 md:gap-6 p-3 md:p-6 rounded-2xl md:rounded-[32px] border-2 text-left transition-all active:scale-95 group",
-                          isSelected 
-                            ? "border-blue-600 bg-blue-50 shadow-xl shadow-blue-500/10" 
+                          isSelected
+                            ? "border-blue-600 bg-blue-50 shadow-xl shadow-blue-500/10"
                             : "border-slate-100 hover:border-slate-300 bg-white"
                         )}
                       >
@@ -944,11 +943,11 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                         <div className="flex flex-col gap-1 md:gap-2">
                           <span className="text-sm md:text-lg font-bold text-slate-800">{opt}</span>
                           {currentQuestion.optionImages?.[i] && (
-                            <img 
-                              src={currentQuestion.optionImages[i]} 
-                              alt={`Option ${label}`} 
+                            <img
+                              src={currentQuestion.optionImages[i]}
+                              alt={`Option ${label}`}
                               referrerPolicy="no-referrer"
-                              className="max-h-20 md:max-h-32 w-auto object-contain rounded-lg border border-slate-100" 
+                              className="max-h-20 md:max-h-32 w-auto object-contain rounded-lg border border-slate-100"
                             />
                           )}
                         </div>
@@ -978,7 +977,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
         {/* Sidebar palette */}
         <AnimatePresence>
           {(showMobileSidebar || window.innerWidth >= 1024) && (
-            <motion.aside 
+            <motion.aside
               initial={window.innerWidth < 1024 ? { x: '100%' } : {}}
               animate={window.innerWidth < 1024 ? { x: 0 } : {}}
               exit={window.innerWidth < 1024 ? { x: '100%' } : {}}
@@ -1002,12 +1001,12 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
                   {cameraFailed ? "Proctoring Camera Offline" : "Initializing Visual Integrity Node..."}
                 </div>
               )}
-              <video 
-                ref={videoRef} 
-                autoPlay 
-                muted 
-                playsInline 
-                className={cn("w-full h-full object-cover", !cameraActive && "hidden")} 
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                className={cn("w-full h-full object-cover", !cameraActive && "hidden")}
               />
               <canvas ref={canvasRef} width="320" height="240" className="hidden" />
               <div className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 bg-black/60 backdrop-blur-md rounded-lg border border-white/20">
@@ -1030,7 +1029,7 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
             <h3 className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] mb-4 md:mb-8 flex items-center gap-3">
               <BrainCircuit size={14} className="md:w-4 md:h-4" strokeWidth={3} /> Interaction Grid
             </h3>
-            
+
             <div className="grid grid-cols-5 md:grid-cols-5 gap-2 md:gap-4">
               {currentQuestions.map((q, i) => {
                 const sub = answers[q.id];
@@ -1074,29 +1073,29 @@ export default function TestInterface({ examId, onExit }: TestInterfaceProps) {
 
           <div className="p-6 md:p-10 bg-slate-50 border-t border-slate-200 space-y-3 md:space-y-4">
             <div className="grid grid-cols-2 gap-3 md:gap-4">
-              <button 
+              <button
                 onClick={handleMarkReview}
                 className="flex items-center justify-center gap-2 py-3 md:py-5 bg-black text-white rounded-2xl md:rounded-3xl text-[8px] md:text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all active:scale-95 shadow-xl shadow-black/10"
               >
                 <Bookmark size={12} className="md:w-[14px] md:h-[14px]" strokeWidth={3} /> Flag Node
               </button>
-              <button 
+              <button
                 onClick={() => handleAnswerSelect(null)}
                 className="flex items-center justify-center gap-2 py-3 md:py-5 bg-white border-2 border-slate-200 text-slate-400 rounded-2xl md:rounded-3xl text-[8px] md:text-[10px] font-black uppercase tracking-widest hover:border-slate-400 hover:text-slate-600 transition-all active:scale-95"
               >
                 Clear Cache
               </button>
             </div>
-            
+
             <div className="grid grid-cols-2 gap-3 md:gap-4">
-              <button 
+              <button
                 disabled={activeQuestionIdx === 0}
                 onClick={() => setActiveQuestionIdx(prev => prev - 1)}
                 className="py-4 md:py-6 bg-slate-200 text-slate-600 rounded-2xl md:rounded-3xl font-black flex items-center justify-center hover:bg-slate-300 disabled:opacity-30 transition-all active:scale-95"
               >
                 <ChevronLeft className="md:w-6 md:h-6" strokeWidth={3} />
               </button>
-              <button 
+              <button
                 disabled={activeQuestionIdx === currentQuestions.length - 1}
                 onClick={() => setActiveQuestionIdx(prev => prev + 1)}
                 className="py-4 md:py-6 bg-blue-600 text-white rounded-2xl md:rounded-3xl font-black flex items-center justify-center hover:bg-blue-700 disabled:opacity-30 transition-all active:scale-95 shadow-xl shadow-blue-600/20"

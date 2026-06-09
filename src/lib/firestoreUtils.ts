@@ -1,4 +1,4 @@
-import { auth } from './firebase';
+import { supabase } from './supabase';
 
 export enum OperationType {
   CREATE = 'create',
@@ -16,13 +16,6 @@ export interface FirestoreErrorInfo {
   authInfo: {
     userId?: string | null;
     email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
   }
 }
 
@@ -30,23 +23,15 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
-        providerId: provider.providerId,
-        email: provider.email,
-      })) || []
+      userId: supabase.auth.getUser().then(({ data }) => data.user?.id).catch(() => null),
+      email: supabase.auth.getUser().then(({ data }) => data.user?.email).catch(() => null),
     },
     operationType,
     path
   }
-  console.error('Firestore Operation Failed: ', JSON.stringify(errInfo));
-  // In development, log a clear message
+  console.error('Database Operation Failed: ', JSON.stringify(errInfo));
   if (process.env.NODE_ENV !== 'production') {
-    console.error(`[FS_ERR] ${operationType} on ${path}: ${errInfo.error}`);
+    console.error(`[DB_ERR] ${operationType} on ${path}: ${errInfo.error}`);
   }
   throw new Error(JSON.stringify(errInfo));
 }
@@ -55,11 +40,11 @@ export const removeUndefined = (obj: any): any => {
   if (obj === null || typeof obj !== 'object' || obj instanceof Date) {
     return obj;
   }
-  
+
   if (Array.isArray(obj)) {
     return obj.filter(item => item !== undefined).map(removeUndefined);
   }
-  
+
   const newObj: any = {};
   Object.keys(obj).forEach(key => {
     if (obj[key] !== undefined) {

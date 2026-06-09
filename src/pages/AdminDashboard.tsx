@@ -1,58 +1,21 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, updateDoc, doc, getDocs, where, deleteDoc, setDoc, increment, writeBatch } from 'firebase/firestore';
-import { db, createSecondaryAuth } from '../lib/firebase';
+import { supabase, mapExamRow, mapUserRow, mapSubmissionRow, ExamRow, UserRow, SubmissionRow } from '../lib/supabase';
 import { handleFirestoreError, OperationType, removeUndefined } from '../lib/firestoreUtils';
 import { useAuth } from '../context/AuthContext';
 import { Exam, UserProfile, Submission } from '../types';
 import { calculateSubmissionScore } from '../lib/scoreUtils';
-import { 
-  Users, 
-  Plus, 
-  BarChart2, 
-  Settings, 
-  LogOut, 
-  Clock, 
-  Calendar,
-  Copy,
-  FileText,
-  Loader2,
-  Trash2,
-  TrendingUp,
-  Search,
-  History,
-  User as UserIcon,
-  AlertTriangle,
-  X,
-  CheckCircle2,
-  ChevronRight,
-  Activity,
-  Eye,
-  BrainCircuit,
-  BarChart3,
-  Trophy,
-  ArrowUpRight,
-  Sparkles,
-  FileUp,
-  Keyboard,
-  Check,
-  AlertCircle,
-  Menu,
-  Printer,
-  Globe
-} from 'lucide-react';
+import { Users, Plus, ChartBar as BarChart2, Settings, LogOut, Clock, Calendar, Copy, FileText, Loader as Loader2, Trash2, TrendingUp, Search, History, User as UserIcon, TriangleAlert as AlertTriangle, X, CircleCheck as CheckCircle2, ChevronRight, Activity, Eye, BrainCircuit, ChartBar as BarChart3, Trophy, ArrowUpRight, Sparkles, FileUp, Keyboard, Check, CircleAlert as AlertCircle, Menu, Printer, Globe } from 'lucide-react';
 import { GlassButton } from '../components/ui/apple-tahoe-liquid-glass-button';
 import SettingsModal from '../components/SettingsModal';
 import { ReviewButton } from '../components/ReviewButton';
-import { auth } from '../lib/firebase';
-import { createUserWithEmailAndPassword, signOut, signInWithEmailAndPassword } from 'firebase/auth';
 import { format, addHours } from 'date-fns';
 import { cn } from '../lib/utils';
 import { compressImage } from '../lib/imageUtils';
 import { motion, AnimatePresence } from 'motion/react';
 import { authenticateGoogle, createSpreadsheet, populateSpreadsheet } from '../lib/googleSheets';
 import { downloadLocalDoc, createGoogleDocInDrive } from '../lib/googleDocs';
-import { 
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell 
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
 } from 'recharts';
 
 const MATH_SYMBOLS = ['π', '√', '²', '³', '∞', '±', '×', '÷', 'α', 'β', 'γ', 'σ', 'λ', 'ρ', 'τ', 'φ', 'θ', 'Δ', 'Σ', 'Ω', 'μ', 'ε', '∫', '≈', '≠', '≤', '≥', '°', '^', '_', '∕', '⁰', '¹', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '∩'];
@@ -392,20 +355,19 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
   const cleanupAiBots = async () => {
     try {
       // Find bots
-      const q = query(collection(db, 'users'), where('displayName', '>=', 'ai bot 1'), where('displayName', '<=', 'ai bot 3\uf8ff'));
-      const snap = await getDocs(q);
-      
-      for (const docSnap of snap.docs) {
-        const botId = docSnap.id;
-        // Delete user
-        await deleteDoc(doc(db, 'users', botId));
-        
+      const { data: bots, error } = await supabase
+        .from('users')
+        .select('id')
+        .gte('display_name', 'ai bot 1')
+        .lte('display_name', 'ai bot 3');
+
+      if (error) throw error;
+
+      for (const bot of bots || []) {
         // Delete submissions
-        const subQ = query(collection(db, 'submissions'), where('userId', '==', botId));
-        const subSnap = await getDocs(subQ);
-        for (const subDoc of subSnap.docs) {
-          await deleteDoc(doc(db, 'submissions', subDoc.id));
-        }
+        await supabase.from('submissions').delete().eq('user_id', bot.id);
+        // Delete user
+        await supabase.from('users').delete().eq('id', bot.id);
       }
       alert('AI Bots and their data cleaned up!');
     } catch (err: any) {
@@ -423,7 +385,10 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const handleUpdatePreparationType = async (uid: string, type: 'JEE' | 'NEET' | 'Both') => {
     try {
-      await updateDoc(doc(db, 'users', uid), { preparationType: type });
+      await supabase
+        .from('users')
+        .update({ preparation_type: type })
+        .eq('id', uid);
       setStudents(prev => prev.map(s => s.uid === uid ? { ...s, preparationType: type } : s));
       setAllUsers(prev => prev.map(s => s.uid === uid ? { ...s, preparationType: type } : s));
     } catch (err: any) {
@@ -433,25 +398,30 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const handleCreateStudent = async (e: React.FormEvent) => {
     try {
-      const { createUserWithEmailAndPassword, updateProfile, signOut } = await import('firebase/auth');
-      
-      const secondaryAuth = createSecondaryAuth();
-      const userCredential = await createUserWithEmailAndPassword(secondaryAuth, newStudentEmail, newStudentPassword);
-      await updateProfile(userCredential.user, { displayName: newStudentName });
-      
-      await setDoc(doc(db, 'users', userCredential.user.uid), {
-        uid: userCredential.user.uid,
-        displayName: newStudentName,
+      const { data: { user: newUser }, error: signUpError } = await supabase.auth.signUp({
         email: newStudentEmail,
-        role: newStudentRole,
-        preparationType: newStudentPrepType,
         password: newStudentPassword,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
+        options: {
+          data: {
+            display_name: newStudentName,
+            role: newStudentRole,
+          }
+        }
       });
-      
-      await signOut(secondaryAuth);
-      
+
+      if (signUpError) throw signUpError;
+
+      if (newUser) {
+        await supabase.from('users').insert({
+          id: newUser.id,
+          display_name: newStudentName,
+          email: newStudentEmail,
+          role: newStudentRole,
+          preparation_type: newStudentPrepType,
+          password: newStudentPassword,
+        });
+      }
+
       // Cleanup
       setNewStudentEmail('');
       setNewStudentPassword('');
@@ -462,7 +432,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
       alert(`${newStudentRole === 'admin' ? 'Admin' : 'Student'} account created successfully! They can now login with these credentials.`);
     } catch (err: any) {
       console.error(err);
-      if (err.code === 'auth/email-already-in-use') {
+      if (err.message?.includes('already registered')) {
         alert('Creation Error: Individual Neural ID (Email) is already registered in the central system.');
       } else {
         alert('Creation Error: ' + err.message);
@@ -471,7 +441,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
       setIsCreatingStudent(false);
     }
   };
-  
+
   // Section Management State
   const [activeCreationSection, setActiveCreationSection] = useState<'Maths' | 'Physics' | 'Chemistry'>('Maths');
   const [sectionsData, setSectionsData] = useState({
@@ -488,7 +458,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
           if (submissions.length > 0) {
             console.log('[SYS] WIPING ALL SUBMISSIONS...');
             for (const sub of submissions) {
-              await deleteDoc(doc(db, 'submissions', sub.id)).catch(e => console.error("Wipe failed for sub", sub.id, e));
+              await supabase.from('submissions').delete().eq('id', sub.id);
             }
             alert('SYSTEM_WIPE_COMPLETE: All submissions have been purged.');
             window.history.replaceState({}, '', window.location.pathname);
@@ -503,8 +473,9 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const fetchUsers = React.useCallback(async () => {
     try {
-      const snap = await getDocs(query(collection(db, 'users')));
-      const usersList = snap.docs.map(d => ({ uid: d.id, ...d.data() } as any as UserProfile));
+      const { data, error } = await supabase.from('users').select('*');
+      if (error) throw error;
+      const usersList = (data || []).map(d => mapUserRow(d as UserRow));
       setAllUsers(usersList);
       setStudents(usersList.filter(u => u.role === 'student'));
       setAdmins(usersList.filter(u => u.role === 'staff' || u.role === 'admin'));
@@ -516,20 +487,9 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const fetchSubmissions = React.useCallback(async () => {
     try {
-      const snap = await getDocs(collection(db, 'submissions'));
-      setSubmissions(snap.docs.map(d => {
-        const data = d.data() as any;
-        let userId = data.userId;
-        let examId = data.examId;
-        if (!userId || !examId) {
-          const parts = d.id.split('_');
-          if (parts.length >= 2) {
-            userId = userId || parts[0];
-            examId = examId || parts[1];
-          }
-        }
-        return { ...data, id: d.id, userId, examId } as Submission;
-      }));
+      const { data, error } = await supabase.from('submissions').select('*');
+      if (error) throw error;
+      setSubmissions((data || []).map(d => mapSubmissionRow(d as SubmissionRow)));
     } catch (err) {
       console.error('AdminDashboard: Submissions fetch failure', err);
       try { handleFirestoreError(err, OperationType.LIST, 'submissions'); } catch (e) {}
@@ -559,23 +519,25 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
       checkReady();
     });
 
-    const unsubExams = onSnapshot(query(collection(db, 'exams'), orderBy('createdAt', 'desc')), 
-      snap => {
-        setExams(snap.docs.map(d => ({ id: d.id, ...d.data() } as Exam)));
-        examsReady = true;
-        checkReady();
-      },
-      err => {
-        console.error('AdminDashboard: Exams fetch failure', err);
-        examsReady = true;
-        checkReady();
-        try { handleFirestoreError(err, OperationType.LIST, 'exams'); } catch (e) {}
+    // Fetch exams
+    const fetchExams = async () => {
+      const { data, error } = await supabase.from('exams').select('*').order('created_at', { ascending: false });
+      if (!error && data) {
+        setExams(data.map(d => mapExamRow(d as ExamRow)));
       }
-    );
+      examsReady = true;
+      checkReady();
+    };
+    fetchExams();
 
-    const unsubSubs = onSnapshot(collection(db, 'submissions'), (snap) => {
-      setSubmissions(snap.docs.map(d => ({ ...d.data(), id: d.id } as Submission)));
-    });
+    // Poll for updates (replacing onSnapshot)
+    const pollInterval = setInterval(async () => {
+      const { data: examData } = await supabase.from('exams').select('*').order('created_at', { ascending: false });
+      if (examData) setExams(examData.map(d => mapExamRow(d as ExamRow)));
+
+      const { data: subData } = await supabase.from('submissions').select('*');
+      if (subData) setSubmissions(subData.map(d => mapSubmissionRow(d as SubmissionRow)));
+    }, 15000);
 
     // Fallback timer if snapshots are taking way too long
     const timeout = setTimeout(() => {
@@ -583,8 +545,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
     }, 8000);
 
     return () => {
-      unsubExams();
-      unsubSubs();
+      clearInterval(pollInterval);
       clearTimeout(timeout);
     };
   }, [user, profile, fetchUsers, fetchSubmissions]);
@@ -592,25 +553,25 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
   // System owner's auto-purge protocol for legacy users
   const runAutoPurge = async () => {
     if (!isGlobalAdmin) return;
-    
+
     if (!confirm("Run system hygiene check? This will purge role-less ghosts and specific target entries.")) return;
 
     console.log("[SYS] Running manual hygiene check...");
-    
+
     // 1. Purge Ghost Profiles (Role-less)
     const roleless = allUsers.filter(u => !u.role);
     if (roleless.length > 0) {
       console.log(`[SYS] Found ${roleless.length} role-less ghosts.`);
       for (const u of roleless) {
-        await deleteDoc(doc(db, 'users', u.uid)).catch(() => {});
+        await supabase.from('users').delete().eq('id', u.uid);
       }
     }
 
     // 2. Purge specific requested names (if any)
     const targetPurgeNames = ['jj', 'sat', 'abinaya', 's.sivabalan', 'bhuvaneshwar r', 'ashwin s', 'je45'];
-    const targetPurgeUsers = allUsers.filter(u => 
-      u.displayName && targetPurgeNames.some(name => 
-        u.displayName?.toLowerCase().includes(name.toLowerCase()) || 
+    const targetPurgeUsers = allUsers.filter(u =>
+      u.displayName && targetPurgeNames.some(name =>
+        u.displayName?.toLowerCase().includes(name.toLowerCase()) ||
         u.email?.toLowerCase().includes(name.toLowerCase())
       )
     );
@@ -904,18 +865,17 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
       const examData = {
         title: examTitle,
-        startTime: new Date(startTime),
-        endTime: new Date(endTime),
+        start_time: new Date(startTime).toISOString(),
+        end_time: new Date(endTime).toISOString(),
         duration: parseInt(examDuration) || 180,
         sections: finalSections,
-        answerKey,
-        preparationType: preparationTypeExam,
-        updatedAt: serverTimestamp()
+        answer_key: answerKey,
+        preparation_type: preparationTypeExam,
       };
 
-      // Size validation to prevent 1MB Firestore limit crash
+      // Size validation to prevent large payloads
       const estimatedSize = new TextEncoder().encode(JSON.stringify(examData)).length;
-      if (estimatedSize > 1040000) { // Slightly under 1MB for safety
+      if (estimatedSize > 1040000) {
         if (confirm(`SYSTEM_LIMIT_REACHED: This exam (approx. ${Math.round(estimatedSize/1024)}KB) exceeds the 1MB database limit. Would you like to attempt BULK COMPRESSION of all images to fix this?`)) {
           await compressAllExamImages();
           return;
@@ -924,36 +884,34 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
       }
 
       if (editingExamId) {
-        await updateDoc(doc(db, 'exams', editingExamId), removeUndefined(examData));
-        
+        await supabase.from('exams').update(examData).eq('id', editingExamId);
+
         // Re-calculate scores for all completed submissions for this exam
         const originalExam = exams.find(e => e.id === editingExamId);
         const examObj = { ...originalExam, ...examData, id: editingExamId } as Exam;
         const examSubs = submissions.filter(s => s.examId === editingExamId && s.status === 'completed');
-        
+
         if (examSubs.length > 0) {
           console.log(`[SYS] Re-scoring ${examSubs.length} submissions for exam: ${editingExamId}`);
-          const updatePromises = examSubs.map(sub => {
+          for (const sub of examSubs) {
             const { score, correct, incorrect, skipped } = calculateSubmissionScore(examObj, sub);
-            return updateDoc(doc(db, 'submissions', sub.id), removeUndefined({
+            await supabase.from('submissions').update({
               score,
-              correctCount: correct,
-              incorrectCount: incorrect,
-              skippedCount: skipped,
-              updatedAt: serverTimestamp()
-            }));
-          });
-          await Promise.all(updatePromises);
+              correct_count: correct,
+              incorrect_count: incorrect,
+              skipped_count: skipped,
+              updated_at: new Date().toISOString()
+            }).eq('id', sub.id);
+          }
           alert(`EXAM_UPDATED: ${examSubs.length} submissions have been re-scored based on the new answer key.`);
         }
       } else {
         const creatorId = user?.uid || profile?.uid;
         if (!creatorId) return alert('Authentication node not ready. Please refresh the page and try again.');
-        
-        await addDoc(collection(db, 'exams'), {
+
+        await supabase.from('exams').insert({
           ...examData,
-          createdBy: creatorId,
-          createdAt: serverTimestamp()
+          created_by: creatorId,
         });
       }
 
@@ -982,18 +940,18 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
     try {
       const creatorId = user?.uid || profile?.uid;
       if (!creatorId) return alert('Authentication node not ready. Please refresh the page and try again.');
-      
-      const { id, ...examData } = examToDuplicate as any; 
-      
-      const duplicatedExam = {
-        ...examData,
-        title: `${examToDuplicate.title} (Copy)`,
-        createdAt: serverTimestamp(),
-        createdBy: creatorId,
-        submissionCount: 0
-      };
 
-      await addDoc(collection(db, 'exams'), duplicatedExam);
+      await supabase.from('exams').insert({
+        title: `${examToDuplicate.title} (Copy)`,
+        start_time: examToDuplicate.startTime?.toDate?.()?.toISOString() || new Date().toISOString(),
+        end_time: examToDuplicate.endTime?.toDate?.()?.toISOString() || new Date().toISOString(),
+        duration: examToDuplicate.duration,
+        sections: examToDuplicate.sections,
+        answer_key: examToDuplicate.answerKey,
+        created_by: creatorId,
+        submission_count: 0,
+        preparation_type: examToDuplicate.preparationType,
+      });
       alert('Exam duplicated successfully!');
     } catch (err) {
       console.error(err);
@@ -1005,9 +963,11 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
     setEditingExamId(exam.id);
     setExamTitle(exam.title);
     setExamDuration(exam.duration.toString());
-    setStartTime(format(exam.startTime.toDate(), "yyyy-MM-dd'T'HH:mm"));
-    setEndTime(format(exam.endTime.toDate(), "yyyy-MM-dd'T'HH:mm"));
-    
+    const startDate = exam.startTime?.toDate?.() || new Date();
+    const endDate = exam.endTime?.toDate?.() || new Date();
+    setStartTime(format(startDate, "yyyy-MM-dd'T'HH:mm"));
+    setEndTime(format(endDate, "yyyy-MM-dd'T'HH:mm"));
+
     const newSectionsData = {
       Maths: { mcqs: [] as any[], numericals: [] as any[] },
       Physics: { mcqs: [] as any[], numericals: [] as any[] },
@@ -1038,7 +998,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
     if (!id) return;
     try {
       console.log(`Initiating purge for exam: ${id}`);
-      await deleteDoc(doc(db, 'exams', id));
+      await supabase.from('exams').delete().eq('id', id);
       setShowCreateModal(false);
       setDeleteHoldExamId(null);
       setDeleteHoldProgress(0);
@@ -1061,7 +1021,7 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const handleDeleteSubmission = async (sub: Submission) => {
     try {
-      await deleteDoc(doc(db, 'submissions', sub.id));
+      await supabase.from('submissions').delete().eq('id', sub.id);
       setSubmissions(prev => prev.filter(s => s.id !== sub.id));
       setReviewSubmission(null);
       await fetchSubmissions();
@@ -1077,17 +1037,18 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const executeUserPurge = async (userId: string, isSilent = false) => {
     if (!isSilent && adminDeleteConfirm !== 'DELETE') return;
-    
+
     setIsPurging(true);
     try {
-      // 1. Delete all submissions for this user (robust check for both field and ID prefix)
+      // 1. Delete all submissions for this user
       const toDelete = submissions.filter(s => s.userId === userId || s.id.startsWith(userId + '_'));
-      const deletePromises = toDelete.map(s => deleteDoc(doc(db, 'submissions', s.id)));
-      await Promise.all(deletePromises);
+      for (const s of toDelete) {
+        await supabase.from('submissions').delete().eq('id', s.id);
+      }
 
       // 2. Delete the user profile doc
-      await deleteDoc(doc(db, 'users', userId));
-      
+      await supabase.from('users').delete().eq('id', userId);
+
       setUserToDelete(null);
       setAdminDeleteConfirm('');
       fetchUsers();
@@ -1119,10 +1080,10 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
 
   const handleUpdateInsight = async (userId: string, insight: string) => {
     try {
-      await updateDoc(doc(db, 'users', userId), {
-        performanceInsight: insight,
-        updatedAt: serverTimestamp()
-      });
+      await supabase.from('users').update({
+        performance_insight: insight,
+        updated_at: new Date().toISOString()
+      }).eq('id', userId);
       alert('Insight updated successfully');
       fetchUsers();
     } catch(err: any) {
@@ -1236,15 +1197,14 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
     const interval = setInterval(async () => {
       const { title, duration, startTime, endTime, sections } = examDraftRef.current;
       try {
-        const examData = {
+        await supabase.from('exams').update({
           title,
           duration: parseInt(duration),
-          startTime: new Date(startTime),
-          endTime: new Date(endTime),
+          start_time: new Date(startTime).toISOString(),
+          end_time: new Date(endTime).toISOString(),
           sections: sections,
-          updatedAt: serverTimestamp()
-        };
-        await updateDoc(doc(db, 'exams', editingExamId), removeUndefined(examData));
+          updated_at: new Date().toISOString()
+        }).eq('id', editingExamId);
         console.log(`[SYS] Auto-saved draft for exam: ${editingExamId}`);
       } catch (err) {
         console.error('[SYS] Auto-save failed', err);
@@ -2087,16 +2047,26 @@ export default function AdminDashboard({ onStartTest }: { onStartTest: (id: stri
                                 </td>
                                 <td className="px-8 py-6 text-right">
                                   <div className="flex justify-end gap-2 shrink-0">
-                                    <button 
+                                    <button
                                       onClick={async () => {
                                         try {
-                                          await updateDoc(doc(db, 'submissions', sub.id), removeUndefined({
+                                          await supabase.from('submissions').update({
                                             hidden: !sub.hidden,
-                                            updatedAt: serverTimestamp()
-                                          }));
-                                          await updateDoc(doc(db, 'exams', sub.examId), {
-                                            submissionCount: increment(sub.hidden ? 1 : -1)
-                                          });
+                                            updated_at: new Date().toISOString()
+                                          }).eq('id', sub.id);
+
+                                          // Update submission count
+                                          const { data: examData } = await supabase
+                                            .from('exams')
+                                            .select('submission_count')
+                                            .eq('id', sub.examId)
+                                            .single();
+
+                                          if (examData) {
+                                            await supabase.from('exams').update({
+                                              submission_count: (examData.submission_count || 0) + (sub.hidden ? 1 : -1)
+                                            }).eq('id', sub.examId);
+                                          }
                                           fetchSubmissions();
                                         } catch (err) {
                                           console.error("Toggle hide failed", err);

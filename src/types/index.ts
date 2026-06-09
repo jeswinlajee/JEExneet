@@ -1,4 +1,8 @@
-import { Timestamp } from 'firebase/firestore';
+// Timestamp-like object (replaces Firebase Timestamp)
+export interface TimestampLike {
+  seconds: number;
+  nanoseconds: number;
+}
 
 export type UserRole = 'student' | 'staff' | 'admin';
 
@@ -10,13 +14,14 @@ export interface UserProfile {
   password?: string;
   sessionId?: string;
   sessionIds?: string[];
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  lastSeen?: Timestamp;
+  createdAt: TimestampLike;
+  updatedAt: TimestampLike;
+  lastSeen?: TimestampLike;
   contactDetail?: string;
   review?: string;
   performanceInsight?: string;
   preparationType?: 'JEE' | 'NEET';
+  requiresVerification?: boolean;
 }
 
 export interface Question {
@@ -39,8 +44,8 @@ export interface ExamSection {
 export interface Exam {
   id: string;
   title: string;
-  startTime: Timestamp;
-  endTime: Timestamp;
+  startTime: TimestampLike;
+  endTime: TimestampLike;
   duration: number; // minutes
   sections: {
     Maths: ExamSection;
@@ -49,7 +54,7 @@ export interface Exam {
   };
   answerKey: Record<string, string | number>;
   createdBy: string;
-  createdAt: Timestamp;
+  createdAt: TimestampLike;
   submissionCount?: number;
   preparationType?: 'JEE' | 'NEET' | 'Both';
 }
@@ -64,14 +69,15 @@ export interface Submission {
   id: string;
   userId: string;
   examId: string;
+  userName?: string;
   answers: Record<string, SubmissionResponse>;
   score: number;
   calculatedScore?: number;
   status: 'in-progress' | 'started' | 'completed';
   currentQuestionIndex?: number;
   currentSection?: string;
-  lastHeartbeat?: Timestamp;
-  submittedAt?: Timestamp;
+  lastHeartbeat?: TimestampLike;
+  submittedAt?: TimestampLike;
   correctCount?: number;
   incorrectCount?: number;
   skippedCount?: number;

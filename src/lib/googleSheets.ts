@@ -1,5 +1,4 @@
-import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
-import { auth } from './firebase';
+import { supabase } from './supabase';
 
 export interface ExportQuestionRow {
   slNo: number;
@@ -33,25 +32,34 @@ export function clearCachedToken() {
   cachedAccessToken = null;
 }
 
-// Google Authentication
+// Google Authentication using Supabase OAuth
 export async function authenticateGoogle(): Promise<string> {
   if (cachedAccessToken) {
     return cachedAccessToken;
   }
 
-  const provider = new GoogleAuthProvider();
-  provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-  provider.addScope('https://www.googleapis.com/auth/drive.file');
-  provider.addScope('https://www.googleapis.com/auth/gmail.readonly');
-  provider.addScope('https://www.googleapis.com/auth/gmail.send');
-
   try {
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        scopes: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
+        skipBrowserRedirect: false,
+      }
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    // For OAuth, we need to get the provider token from the session
+    const { data: { session } } = await supabase.auth.getSession();
+    const providerToken = session?.provider_token;
+
+    if (!providerToken) {
       throw new Error('Google authorization failed to return an access security token.');
     }
-    cachedAccessToken = credential.accessToken;
+
+    cachedAccessToken = providerToken;
     return cachedAccessToken;
   } catch (error: any) {
     console.error('Google authorization sequence failed:', error);

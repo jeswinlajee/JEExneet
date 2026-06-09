@@ -1,43 +1,24 @@
 import React, { useState, useEffect } from 'react';
-import { collection, query, where, orderBy, onSnapshot } from 'firebase/firestore';
-import { db } from '../lib/firebase';
+import { supabase, mapExamRow, mapSubmissionRow, mapUserRow, ExamRow, SubmissionRow, UserRow } from '../lib/supabase';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { useAuth } from '../context/AuthContext';
-import { Exam, Submission } from '../types';
+import { Exam, Submission, TimestampLike } from '../types';
 import { calculateSubmissionScore } from '../lib/scoreUtils';
-import { 
-  BarChart3, 
-  Calendar, 
-  Clock, 
-  ChevronRight, 
-  Globe,
-  Settings, 
-  User as UserIcon,
-  LogOut,
-  Trophy,
-  History,
-  LayoutDashboard,
-  BrainCircuit,
-  Sparkles,
-  ArrowUpRight,
-  Loader2,
-  X,
-  CheckCircle2,
-  Activity,
-  FileText,
-  Trash2,
-  AlertTriangle,
-  Printer
-} from 'lucide-react';
+import { ChartBar as BarChart3, Calendar, Clock, ChevronRight, Globe, Settings, User as UserIcon, LogOut, Trophy, History, LayoutDashboard, BrainCircuit, Sparkles, ArrowUpRight, Loader as Loader2, X, CircleCheck as CheckCircle2, Activity, FileText, Trash2, TriangleAlert as AlertTriangle, Printer } from 'lucide-react';
 import { format } from 'date-fns';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid, AreaChart, Area, BarChart, Bar, Cell } from 'recharts';
 import SettingsModal from '../components/SettingsModal';
 import { ReviewButton } from '../components/ReviewButton';
-import { auth } from '../lib/firebase';
 import { authenticateGoogle, createSpreadsheet, populateSpreadsheet } from '../lib/googleSheets';
 import { downloadLocalDoc, createGoogleDocInDrive } from '../lib/googleDocs';
+
+// Helper to convert TimestampLike to Date
+const toDate = (ts: TimestampLike | undefined | null): Date => {
+  if (!ts) return new Date();
+  return new Date(ts.seconds * 1000);
+};
 
 interface StudentDashboardProps {
   onStartTest: (examId: string) => void;
@@ -87,25 +68,28 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
     setIsVerifyingGmail(true);
     setReportGenState({ status: 'idle' });
     try {
-      const { signInWithPopup, GoogleAuthProvider } = await import('firebase/auth');
-      const provider = new GoogleAuthProvider();
-      provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-      provider.addScope('https://www.googleapis.com/auth/drive.file');
-      provider.addScope('https://www.googleapis.com/auth/gmail.readonly');
-      provider.addScope('https://www.googleapis.com/auth/gmail.send');
-      
-      const result = await signInWithPopup(auth, provider);
-      const credential = GoogleAuthProvider.credentialFromResult(result);
-      const user = result.user;
-      
-      if (!credential?.accessToken) {
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          scopes: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
+        }
+      });
+
+      if (error) throw error;
+
+      // Get the session after OAuth
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
+      const providerToken = session?.provider_token;
+
+      if (!providerToken) {
         throw new Error('Google authentication succeeded but did not yield an API access token.');
       }
-      
+
       setVerifiedGoogleUser({
-        email: user.email || '',
-        displayName: user.displayName || 'Authorized User',
-        photoURL: user.photoURL
+        email: user?.email || '',
+        displayName: user?.user_metadata?.full_name || 'Authorized User',
+        photoURL: user?.user_metadata?.avatar_url || null
       });
     } catch (err: any) {
       console.error("Gmail verification failure:", err);
@@ -151,8 +135,8 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
       const skipped = sub.skippedCount ?? res.skipped;
       const score = sub.score ?? res.score;
       const accuracy = correct + incorrect > 0 ? Math.round((correct / (correct + incorrect)) * 100) : 0;
-      const formattedDate = sub.submittedAt 
-        ? format(sub.submittedAt.toDate(), 'yyyy-MM-dd HH:mm')
+      const formattedDate = sub.submittedAt
+        ? format(toDate(sub.submittedAt), 'yyyy-MM-dd HH:mm')
         : format(new Date(), 'yyyy-MM-dd HH:mm');
 
       const sheetTitle = `Conqueror Assessment: ${exam.title}`;
@@ -278,86 +262,66 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
   };
 
   useEffect(() => {
-    // Listen for exams
-    const qExams = query(collection(db, 'exams'), orderBy('createdAt', 'desc'));
-    const unsubscribeExams = onSnapshot(qExams, 
-      (snapshot) => {
-        setExams(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Exam)));
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'exams')
-    );
+    // Fetch exams
+    const fetchData = async () => {
+      const { data: examData, error: examError } = await supabase
+        .from('exams')
+        .select('*')
+        .order('created_at', { ascending: false });
 
-    if (!profile?.uid) return;
+      if (!examError && examData) {
+        setExams(examData.map(d => mapExamRow(d as ExamRow)));
+      }
 
-    // Listen for my submissions
-    const qSubs = query(collection(db, 'submissions'), where('userId', '==', profile.uid));
-    const unsubscribeSubs = onSnapshot(qSubs, 
-      (snapshot) => {
-        const subs = snapshot.docs.map(doc => {
-          const data = doc.data() as any;
-          let userId = data.userId;
-          let examId = data.examId;
-          if (!userId || !examId) {
-            const parts = doc.id.split('_');
-            if (parts.length >= 2) {
-              userId = userId || parts[0];
-              examId = examId || parts[1];
-            }
-          }
-          return { ...data, id: doc.id, userId, examId } as Submission;
-        });
-        setSubmissions(subs);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'submissions')
-    );
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select('id, display_name, role');
 
-    // Listen for ALL completed submissions for comparison
-    const qAllSubs = query(collection(db, 'submissions'), where('status', '==', 'completed'));
-    const unsubscribeAllSubs = onSnapshot(qAllSubs, 
-      (snapshot) => {
-        const subs = snapshot.docs.map(doc => {
-          const data = doc.data() as any;
-          let userId = data.userId;
-          let examId = data.examId;
-          if (!userId || !examId) {
-            const parts = doc.id.split('_');
-            if (parts.length >= 2) {
-              userId = userId || parts[0];
-              examId = examId || parts[1];
-            }
-          }
-          return { ...data, id: doc.id, userId, examId } as Submission;
-        }).filter(s => !s.hidden); // Filter out hidden scores
-        setAllSubmissions(subs);
-        setLoading(false);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'submissions')
-    );
-
-    // Fetch all users to map IDs to usernames
-    const unsubscribeUsers = onSnapshot(collection(db, 'users'), 
-      (snapshot) => {
+      if (!userError && userData) {
         const usersMap: Record<string, string> = {};
-        snapshot.docs.forEach(doc => {
-          const data = doc.data();
-          usersMap[doc.id] = data.role === 'admin' ? 'Admin Testing' : (data.displayName || 'Unknown Candidate');
+        userData.forEach((u: any) => {
+          usersMap[u.id] = u.role === 'admin' ? 'Admin Testing' : (u.display_name || 'Unknown Candidate');
         });
         setAllUsers(usersMap);
       }
-    );
+
+      if (profile?.uid) {
+        const { data: subData } = await supabase
+          .from('submissions')
+          .select('*')
+          .eq('user_id', profile.uid);
+
+        if (subData) {
+          setSubmissions(subData.map(d => mapSubmissionRow(d as SubmissionRow)));
+        }
+
+        const { data: allSubData } = await supabase
+          .from('submissions')
+          .select('*')
+          .eq('status', 'completed');
+
+        if (allSubData) {
+          setAllSubmissions(allSubData.filter((s: any) => !s.hidden).map(d => mapSubmissionRow(d as SubmissionRow)));
+        }
+      }
+
+      setLoading(false);
+    };
+
+    fetchData();
+
+    // Poll for updates
+    const pollInterval = setInterval(fetchData, 15000);
 
     return () => {
-      unsubscribeExams();
-      unsubscribeSubs();
-      unsubscribeAllSubs();
-      unsubscribeUsers();
+      clearInterval(pollInterval);
     };
   }, [profile?.uid]);
 
   const getStatus = (exam: Exam) => {
     const now = new Date();
-    const start = exam.startTime.toDate();
-    const end = exam.endTime.toDate();
+    const start = toDate(exam.startTime);
+    const end = toDate(exam.endTime);
     const sub = submissions.find(s => s.examId === exam.id);
 
     if (sub?.status === 'completed') return 'completed';
@@ -383,19 +347,15 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
 
   const handleDeleteAccount = async () => {
     if (!profile?.uid || deleteConfirmInput.toLowerCase() !== 'delete') return;
-    
+
     setIsDeleting(true);
     try {
-      const { doc, deleteDoc, getDocs, collection, query, where } = await import('firebase/firestore');
-      
       // 1. Purge submissions
-      const subSnap = await getDocs(query(collection(db, 'submissions'), where('userId', '==', profile.uid)));
-      const subPromises = subSnap.docs.map(d => deleteDoc(doc(db, 'submissions', d.id)));
-      await Promise.all(subPromises);
+      await supabase.from('submissions').delete().eq('user_id', profile.uid);
 
       // 2. Delete user profile
-      await deleteDoc(doc(db, 'users', profile.uid));
-      
+      await supabase.from('users').delete().eq('id', profile.uid);
+
       // 3. Close modal and logout
       setShowDeleteModal(false);
       logout();
@@ -759,7 +719,7 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
                           </div>
                           <div className="text-center">
                             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1 italic">Submitted At</p>
-                            <p className="text-4xl font-black text-slate-900">{format(reviewExam.sub.submittedAt?.toDate() || new Date(), 'HH:mm')}</p>
+                            <p className="text-4xl font-black text-slate-900">{format(toDate(reviewExam.sub.submittedAt), 'HH:mm')}</p>
                           </div>
                         </>
                       );
@@ -1406,7 +1366,7 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
                             </button>
                           ) : status === 'upcoming' ? (
                             <div className="w-full text-center py-4 bg-slate-100/50 rounded-2xl text-[10px] font-black text-slate-400 uppercase tracking-widest border-2 border-dashed border-slate-200">
-                               Session opens at {format(exam.startTime.toDate(), 'p')}
+                               Session opens at {format(toDate(exam.startTime), 'p')}
                             </div>
                           ) : (
                             <div className="w-full text-center py-4 bg-slate-50 rounded-2xl text-[10px] font-black text-slate-300 uppercase tracking-widest italic">
@@ -1585,8 +1545,8 @@ export default function StudentDashboard({ onStartTest }: StudentDashboardProps)
                             const res = exam ? calculateSubmissionScore(exam, sub) : { score: 0, correct: 0, incorrect: 0, skipped: 0 };
                             const score = sub.score ?? res.score;
                             const correct = sub.correctCount ?? res.correct;
-                            const dateFormatted = sub.submittedAt 
-                              ? format(sub.submittedAt.toDate(), 'MMMM d, yyyy @ HH:mm')
+                            const dateFormatted = sub.submittedAt
+                              ? format(toDate(sub.submittedAt), 'MMMM d, yyyy @ HH:mm')
                               : 'Unknown Date';
 
                             return (

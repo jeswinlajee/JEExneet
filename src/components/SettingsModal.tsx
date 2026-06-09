@@ -1,15 +1,12 @@
 import React, { useState } from 'react';
-import { updateProfile, updatePassword, User, deleteUser } from 'firebase/auth';
-import { doc, updateDoc, serverTimestamp, deleteDoc, collection, query, where, getDocs, writeBatch, documentId } from 'firebase/firestore';
-import { db, auth } from '../lib/firebase';
-import { removeUndefined } from '../lib/firestoreUtils';
+import { supabase } from '../lib/supabase';
 import { UserProfile } from '../types';
-import { X, User as UserIcon, Lock, Phone, MessageSquare, Loader2, CheckCircle2, AlertCircle, Trash2, ShieldAlert } from 'lucide-react';
+import { X, User as UserIcon, Lock, Phone, MessageSquare, Loader as Loader2, CircleCheck as CheckCircle2, CircleAlert as AlertCircle, Trash2, ShieldAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 
 interface SettingsModalProps {
-  user: User | null;
+  user: { uid: string; email: string | null } | null;
   profile: UserProfile | null;
   onClose: () => void;
 }
@@ -37,15 +34,20 @@ export default function SettingsModal({ user, profile, onClose }: SettingsModalP
     setSuccess(null);
 
     try {
-      // Update Firebase Auth Profile
-      await updateProfile(user, { displayName });
+      // Update Supabase Auth metadata
+      await supabase.auth.updateUser({
+        data: { display_name: displayName }
+      });
 
-      // Update Firestore Profile
-      await updateDoc(doc(db, 'users', user.uid), removeUndefined({
-        displayName,
-        contactDetail,
-        updatedAt: serverTimestamp()
-      }));
+      // Update users table
+      await supabase
+        .from('users')
+        .update({
+          display_name: displayName,
+          contact_detail: contactDetail,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', user.uid);
 
       setSuccess('Profile updated successfully!');
     } catch (err: any) {
@@ -73,8 +75,12 @@ export default function SettingsModal({ user, profile, onClose }: SettingsModalP
     setSuccess(null);
 
     try {
-      await updatePassword(user, newPassword);
-      
+      const { error: updateError } = await supabase.auth.updateUser({
+        password: newPassword
+      });
+
+      if (updateError) throw updateError;
+
       if (sendNotification) {
         await fetch('/api/notify-password-change', {
           method: 'POST',
@@ -98,395 +104,290 @@ export default function SettingsModal({ user, profile, onClose }: SettingsModalP
     await performPasswordUpdate(false);
   };
 
-  const handleUpdateAdminPassword = async () => {
-    await performPasswordUpdate(true);
-  };
-
-  const handleSubmitReview = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user || !profile) return;
+  const handleSaveFeedback = async () => {
+    if (!user) return;
 
     setLoading(true);
     setError(null);
     setSuccess(null);
 
     try {
-      await updateDoc(doc(db, 'users', user.uid), removeUndefined({
-        review,
-        updatedAt: serverTimestamp()
-      }));
-      setSuccess('Audit review submitted successfully!');
+      await supabase
+        .from('users')
+        .update({
+          review,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', user.uid);
+
+      setSuccess('Feedback saved successfully!');
     } catch (err: any) {
-      setError(err.message || 'Failed to submit review');
+      setError(err.message || 'Failed to save feedback');
     } finally {
       setLoading(false);
     }
   };
 
   const handleDeleteAccount = async () => {
-    if (!user || !profile) return;
-    if (deleteConfirm !== 'DELETE') return;
+    if (!user || deleteConfirm.toLowerCase() !== 'delete') return;
 
     setLoading(true);
-    setError(null);
-
     try {
-      // 1. Delete Submissions - Robust check for both userId field and ID prefix
-      const [userSubDocs, idSubDocs] = await Promise.all([
-        getDocs(query(collection(db, 'submissions'), where('userId', '==', user.uid))),
-        getDocs(query(collection(db, 'submissions'), where(documentId(), '>=', user.uid + '_'), where(documentId(), '<', user.uid + '{')))
-      ]);
-      
-      const batch = writeBatch(db);
-      userSubDocs.forEach((doc) => batch.delete(doc.ref));
-      idSubDocs.forEach((doc) => batch.delete(doc.ref));
-      
-      // 2. Delete Profile
-      batch.delete(doc(db, 'users', user.uid));
-      
-      await batch.commit();
+      // Delete submissions
+      await supabase.from('submissions').delete().eq('user_id', user.uid);
 
-      // 3. Delete Auth User
-      await deleteUser(user);
-      
+      // Delete user profile
+      await supabase.from('users').delete().eq('id', user.uid);
+
+      // Delete auth user
+      await supabase.auth.signOut();
+
       onClose();
-      window.location.reload(); // Force reload to clear state
     } catch (err: any) {
-      if (err.code === 'auth/requires-recent-login') {
-        setError('CRITICAL: Account deletion requires a fresh login. Please log out and log back in to proceed with permanent destruction.');
-      } else {
-        setError(err.message || 'Failed to destroy account. Systems error.');
-      }
+      setError(err.message || 'Failed to delete account');
     } finally {
       setLoading(false);
     }
   };
 
+  if (!profile) return null;
+
   return (
-    <motion.div 
+    <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[300] bg-slate-950/90 backdrop-blur-xl flex items-center justify-center p-6"
+      className="fixed inset-0 z-[100] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4"
+      onClick={onClose}
     >
-      <motion.div 
-        initial={{ scale: 0.9, y: 30 }}
+      <motion.div
+        initial={{ scale: 0.95, y: 20 }}
         animate={{ scale: 1, y: 0 }}
-        exit={{ scale: 0.9, y: 30 }}
-        className="bg-white rounded-[48px] w-full max-w-4xl max-h-[85vh] overflow-hidden flex shadow-2xl relative"
+        exit={{ scale: 0.95, y: 20 }}
+        className="bg-white rounded-[32px] w-full max-w-2xl max-h-[90vh] overflow-hidden shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
       >
-        <button 
-          onClick={onClose}
-          className="absolute top-8 right-8 p-3 bg-slate-100 rounded-2xl hover:bg-slate-200 transition-all text-slate-600 z-10"
-        >
-          <X size={20} />
-        </button>
-
-        {/* Sidebar Tabs */}
-        <aside className="w-72 bg-slate-50 border-r border-slate-100 p-10 flex flex-col gap-4">
-          <div className="mb-10 text-left">
-            <h2 className="text-[10px] font-black text-blue-600 uppercase tracking-[0.4em] mb-2 text-left">System Config</h2>
-            <h1 className="text-3xl font-black italic tracking-tighter uppercase leading-none text-left">Internal Settings</h1>
+        {/* Header */}
+        <div className="p-8 border-b border-slate-100 flex justify-between items-center">
+          <div>
+            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Account Settings</h2>
+            <p className="text-sm text-slate-500 font-medium">Manage your profile and preferences</p>
           </div>
-
-          <button 
-            onClick={() => setActiveTab('profile')}
-            className={cn(
-              "flex items-center gap-4 p-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all",
-              activeTab === 'profile' ? "bg-white text-blue-600 shadow-xl shadow-blue-500/10 border border-blue-50" : "text-slate-400 hover:bg-slate-100 hover:text-slate-900"
-            )}
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-slate-100 rounded-xl transition-colors"
           >
-            <UserIcon size={18} /> Profile Sync
+            <X size={20} className="text-slate-400" />
           </button>
-          
-          <button 
-            onClick={() => setActiveTab('security')}
-            className={cn(
-              "flex items-center gap-4 p-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all",
-              activeTab === 'security' ? "bg-white text-blue-600 shadow-xl shadow-blue-500/10 border border-blue-50" : "text-slate-400 hover:bg-slate-100 hover:text-slate-900"
-            )}
-          >
-            <Lock size={18} /> Neural Hash
-          </button>
+        </div>
 
-          <button 
-            onClick={() => setActiveTab('feedback')}
-            className={cn(
-              "flex items-center gap-4 p-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all",
-              activeTab === 'feedback' ? "bg-white text-blue-600 shadow-xl shadow-blue-500/10 border border-blue-50" : "text-slate-400 hover:bg-slate-100 hover:text-slate-900"
-            )}
-          >
-            <MessageSquare size={18} /> System Audit
-          </button>
+        {/* Tabs */}
+        <div className="flex border-b border-slate-100">
+          {[
+            { id: 'profile', label: 'Profile', icon: <UserIcon size={16} /> },
+            { id: 'security', label: 'Security', icon: <Lock size={16} /> },
+            { id: 'feedback', label: 'Feedback', icon: <MessageSquare size={16} /> },
+            { id: 'danger', label: 'Danger Zone', icon: <ShieldAlert size={16} /> },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={cn(
+                "flex-1 py-4 px-6 text-sm font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-all",
+                activeTab === tab.id
+                  ? "text-blue-600 border-b-2 border-blue-600 bg-blue-50/50"
+                  : "text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+              )}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </div>
 
-          <button 
-            onClick={() => setActiveTab('danger')}
-            className={cn(
-              "flex items-center gap-4 p-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all border border-transparent",
-              activeTab === 'danger' ? "bg-red-50 text-red-600 border-red-100 shadow-xl shadow-red-500/10" : "text-red-400/60 hover:bg-red-50/50 hover:text-red-600"
-            )}
-          >
-            <Trash2 size={18} /> Account Void
-          </button>
-
-          <div className="mt-auto pt-10 border-t border-slate-200 text-left">
-            <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest leading-none mb-2">Authenticated As</p>
-            <p className="text-sm font-black text-slate-900 truncate uppercase italic tracking-tighter">{profile?.email}</p>
-          </div>
-        </aside>
-
-        {/* Content Area */}
-        <div className="flex-1 p-16 overflow-y-auto custom-scrollbar text-left">
+        {/* Content */}
+        <div className="p-8 overflow-y-auto max-h-[60vh]">
           <AnimatePresence mode="wait">
             {activeTab === 'profile' && (
-              <motion.div 
+              <motion.div
                 key="profile"
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -20 }}
-                className="space-y-10"
               >
-                <div className="text-left">
-                  <h3 className="text-2xl font-black italic tracking-tighter uppercase mb-4 text-left">Identity Synchronization</h3>
-                  <p className="text-slate-500 font-medium">Configure your public-facing handle and contact parameters.</p>
-                </div>
-
-                <form onSubmit={handleUpdateProfile} className="space-y-8">
-                  <div className="space-y-4">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] italic ml-4">Full Username</label>
-                    <div className="relative group">
-                      <div className="absolute inset-y-0 left-6 flex items-center text-slate-300 group-focus-within:text-blue-600 transition-colors">
-                        <UserIcon size={20} />
-                      </div>
-                      <input 
-                        type="text" 
-                        value={displayName}
-                        onChange={(e) => setDisplayName(e.target.value)}
-                        placeholder="Neural Identity"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-3xl py-5 pl-16 pr-8 text-sm font-bold focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all"
-                        required
-                      />
-                    </div>
+                <form onSubmit={handleUpdateProfile} className="space-y-6">
+                  <div>
+                    <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Display Name</label>
+                    <input
+                      type="text"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600 outline-none transition-all font-medium"
+                    />
                   </div>
-
-                  <div className="space-y-4">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] italic ml-4">Contact Link / Detail</label>
-                    <div className="relative group">
-                      <div className="absolute inset-y-0 left-6 flex items-center text-slate-300 group-focus-within:text-blue-600 transition-colors">
-                        <Phone size={20} />
-                      </div>
-                      <input 
-                        type="text" 
-                        value={contactDetail}
-                        onChange={(e) => setContactDetail(e.target.value)}
-                        placeholder="+91-XXXX-XXXXXX or Social ID"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-3xl py-5 pl-16 pr-8 text-sm font-bold focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all"
-                      />
-                    </div>
+                  <div>
+                    <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Email</label>
+                    <input
+                      type="email"
+                      value={profile.email}
+                      disabled
+                      className="w-full px-4 py-3 bg-slate-100 border border-slate-200 rounded-xl text-slate-400 font-medium cursor-not-allowed"
+                    />
                   </div>
-
-                  <button 
+                  <div>
+                    <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Contact Detail</label>
+                    <input
+                      type="text"
+                      value={contactDetail}
+                      onChange={(e) => setContactDetail(e.target.value)}
+                      placeholder="Phone number or alternate email"
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600 outline-none transition-all font-medium"
+                    />
+                  </div>
+                  <button
+                    type="submit"
                     disabled={loading}
-                    className="w-full bg-slate-900 text-white font-black text-xs uppercase tracking-widest py-6 rounded-3xl hover:bg-blue-600 transition-all flex items-center justify-center gap-3 disabled:opacity-50 shadow-xl shadow-slate-900/10"
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
                   >
-                    {loading ? <Loader2 size={18} className="animate-spin" /> : 'REWRITE IDENTITY PROTOCOL'}
+                    {loading && <Loader2 className="animate-spin" size={18} />}
+                    Save Changes
                   </button>
                 </form>
               </motion.div>
             )}
 
             {activeTab === 'security' && (
-              <motion.div 
+              <motion.div
                 key="security"
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -20 }}
-                className="space-y-10"
               >
-                <div className="text-left">
-                  <h3 className="text-2xl font-black italic tracking-tighter uppercase mb-4 text-left">Credential Encryption</h3>
-                  <p className="text-slate-500 font-medium text-left">Update your neural hash to maintain session integrity.</p>
-                </div>
-
-                <form onSubmit={handleUpdatePassword} className="space-y-8">
-                  <div className="space-y-4">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] italic ml-4">New Hash Protocol</label>
-                    <div className="relative group">
-                      <div className="absolute inset-y-0 left-6 flex items-center text-slate-300 group-focus-within:text-blue-600 transition-colors">
-                        <Lock size={20} />
-                      </div>
-                      <input 
-                        type="password" 
-                        value={newPassword}
-                        onChange={(e) => setNewPassword(e.target.value)}
-                        placeholder="••••••••••••"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-3xl py-5 pl-16 pr-8 text-sm font-bold focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all"
-                        required
-                      />
-                    </div>
+                <form onSubmit={handleUpdatePassword} className="space-y-6">
+                  <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 mb-6">
+                    <p className="text-sm text-blue-700 font-medium">Update your password to keep your account secure.</p>
                   </div>
-
-                  <div className="space-y-4 text-left">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] italic ml-4">Confirm Hash Vector</label>
-                    <div className="relative group">
-                      <div className="absolute inset-y-0 left-6 flex items-center text-slate-300 group-focus-within:text-blue-600 transition-colors">
-                        <Lock size={20} />
-                      </div>
-                      <input 
-                        type="password" 
-                        value={confirmPassword}
-                        onChange={(e) => setConfirmPassword(e.target.value)}
-                        placeholder="••••••••••••"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-3xl py-5 pl-16 pr-8 text-sm font-bold focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all"
-                        required
-                      />
-                    </div>
+                  <div>
+                    <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">New Password</label>
+                    <input
+                      type="password"
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600 outline-none transition-all font-medium"
+                    />
                   </div>
-
-                  <button 
+                  <div>
+                    <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Confirm Password</label>
+                    <input
+                      type="password"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600 outline-none transition-all font-medium"
+                    />
+                  </div>
+                  <button
+                    type="submit"
                     disabled={loading}
-                    className="w-full bg-slate-900 text-white font-black text-xs uppercase tracking-widest py-6 rounded-3xl hover:bg-blue-600 transition-all flex items-center justify-center gap-3 disabled:opacity-50 shadow-xl shadow-slate-900/10"
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
                   >
-                    {loading ? <Loader2 size={18} className="animate-spin" /> : 'ROTATE SECURITY KEY'}
+                    {loading && <Loader2 className="animate-spin" size={18} />}
+                    Update Password
                   </button>
-                  
-                  {profile?.role === 'admin' && (
-                    <button 
-                      type="button"
-                      onClick={handleUpdateAdminPassword}
-                      className="w-full bg-amber-50 text-amber-700 font-black text-xs uppercase tracking-widest py-6 rounded-3xl hover:bg-amber-100 transition-all"
-                    >
-                      CHANGE ADMIN PASSWORD
-                    </button>
-                  )}
-                  
-                  <p className="text-[9px] font-bold text-slate-400 uppercase text-center tracking-widest leading-relaxed px-10">
-                    Warning: Major security rotations may terminate active sessions on other neural nodes. Re-authentication might be requested.
-                  </p>
                 </form>
               </motion.div>
             )}
 
             {activeTab === 'feedback' && (
-              <motion.div 
+              <motion.div
                 key="feedback"
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -20 }}
-                className="space-y-10"
+                className="space-y-6"
               >
-                <div className="text-left">
-                  <h3 className="text-2xl font-black italic tracking-tighter uppercase mb-4">Functional Review</h3>
-                  <p className="text-slate-500 font-medium">Provide your subjective audit of the Elite system architecture.</p>
+                <div>
+                  <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Your Review / Feedback</label>
+                  <textarea
+                    value={review}
+                    onChange={(e) => setReview(e.target.value)}
+                    rows={6}
+                    placeholder="Share your thoughts about the platform..."
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600 outline-none transition-all font-medium resize-none"
+                  />
                 </div>
-
-                <form onSubmit={handleSubmitReview} className="space-y-8">
-                  <div className="space-y-4">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] italic ml-4">Subjective Assessment / Feedback</label>
-                    <textarea 
-                      value={review}
-                      onChange={(e) => setReview(e.target.value)}
-                      placeholder="Your evaluation of the assessment terminal..."
-                      className="w-full bg-slate-50 border border-slate-200 rounded-[32px] p-8 text-sm font-bold focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all min-h-[200px] resize-none"
-                    />
-                  </div>
-
-                  <button 
-                    disabled={loading}
-                    className="w-full bg-slate-900 text-white font-black text-xs uppercase tracking-widest py-6 rounded-3xl hover:bg-blue-600 transition-all flex items-center justify-center gap-3 disabled:opacity-50 shadow-xl shadow-slate-900/10"
-                  >
-                    {loading ? <Loader2 size={18} className="animate-spin" /> : 'SUBMIT NEURAL AUDIT'}
-                  </button>
-                </form>
+                <button
+                  onClick={handleSaveFeedback}
+                  disabled={loading}
+                  className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
+                >
+                  {loading && <Loader2 className="animate-spin" size={18} />}
+                  Save Feedback
+                </button>
               </motion.div>
             )}
 
             {activeTab === 'danger' && (
-              <motion.div 
+              <motion.div
                 key="danger"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                className="space-y-10"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-6"
               >
-                <div className="p-10 bg-red-50 border-2 border-red-100 rounded-[40px] text-left">
-                  <div className="w-16 h-16 bg-red-100 text-red-600 rounded-3xl flex items-center justify-center mb-6">
-                    <ShieldAlert size={32} />
-                  </div>
-                  <h3 className="text-3xl font-black italic tracking-tighter uppercase mb-4 text-red-600">Account Termination Protocol</h3>
-                  <p className="text-red-900/60 font-bold mb-8 leading-relaxed">
-                    Initiating this protocol will result in the <span className="text-red-600 underline decoration-2 underline-offset-4">permanent destruction</span> of your neural profile, all objective assessments, historical scores, and credential access. This action cannot be reversed by system administrators.
-                  </p>
-                  
-                  <div className="space-y-6">
-                    <div className="space-y-2">
-                      <p className="text-[10px] font-black text-red-400 uppercase tracking-widest italic ml-2">Type "DELETE" to confirm authorization</p>
-                      <input 
-                        type="text"
-                        value={deleteConfirm}
-                        onChange={(e) => setDeleteConfirm(e.target.value)}
-                        placeholder="UNAUTHORIZED_TERMINATION_LOCKED"
-                        className="w-full bg-white border-2 border-red-200 rounded-2xl py-4 px-6 text-sm font-black tracking-widest placeholder:text-red-100 focus:outline-none focus:border-red-600 transition-colors"
-                      />
+                <div className="bg-red-50 border border-red-100 rounded-xl p-6">
+                  <div className="flex items-start gap-4">
+                    <ShieldAlert className="text-red-500 shrink-0 mt-1" size={24} />
+                    <div>
+                      <h3 className="font-bold text-red-800 mb-2">Delete Account</h3>
+                      <p className="text-sm text-red-600 leading-relaxed">This action is permanent and cannot be undone. All your data will be permanently deleted.</p>
                     </div>
-
-                    <button 
-                      disabled={deleteConfirm !== 'DELETE' || loading}
-                      onClick={handleDeleteAccount}
-                      className={cn(
-                        "w-full py-6 rounded-3xl font-black text-xs uppercase tracking-[0.4em] flex items-center justify-center gap-4 transition-all shadow-2xl",
-                        deleteConfirm === 'DELETE' 
-                          ? "bg-red-600 text-white shadow-red-500/30 hover:bg-red-700 hover:-translate-y-1" 
-                          : "bg-red-100 text-red-300 cursor-not-allowed"
-                      )}
-                    >
-                      {loading ? <Loader2 size={18} className="animate-spin" /> : (
-                        <>
-                          <Trash2 size={18} />
-                          Finalize Termination
-                        </>
-                      )}
-                    </button>
                   </div>
                 </div>
-
-                <div className="flex gap-4 p-8 bg-slate-50 rounded-3xl border border-slate-100">
-                  <AlertCircle className="text-slate-400 shrink-0" size={20} />
-                  <p className="text-[10px] font-bold text-slate-400 leading-relaxed uppercase tracking-widest">
-                    External data nodes and cached session identifiers may persist for up to 24 hours across global edge networks before total synchronization is achieved.
-                  </p>
+                <div>
+                  <label className="block text-xs font-black text-slate-500 uppercase tracking-widest mb-2">Type "delete" to confirm</label>
+                  <input
+                    type="text"
+                    value={deleteConfirm}
+                    onChange={(e) => setDeleteConfirm(e.target.value)}
+                    placeholder="delete"
+                    className="w-full px-4 py-3 bg-red-50 border border-red-200 rounded-xl focus:ring-2 focus:ring-red-500 outline-none transition-all font-medium text-red-900"
+                  />
                 </div>
+                <button
+                  onClick={handleDeleteAccount}
+                  disabled={loading || deleteConfirm.toLowerCase() !== 'delete'}
+                  className="w-full bg-red-600 text-white py-3 rounded-xl font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-500/20 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loading && <Loader2 className="animate-spin" size={18} />}
+                  <Trash2 size={18} />
+                  Delete My Account
+                </button>
               </motion.div>
             )}
           </AnimatePresence>
 
-          {/* Status Indicators */}
-          <div className="mt-8">
-            <AnimatePresence>
-              {success && (
-                <motion.div 
-                  initial={{ opacity: 0, scale: 0.9, y: 10 }}
-                  animate={{ opacity: 1, scale: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.9, y: 10 }}
-                  className="bg-green-50 border border-green-100 p-6 rounded-3xl flex items-center gap-4 text-green-700"
-                >
-                  <CheckCircle2 size={24} className="shrink-0" />
-                  <p className="text-xs font-black uppercase tracking-tight">{success}</p>
-                </motion.div>
-              )}
-              {error && (
-                <motion.div 
-                  initial={{ opacity: 0, scale: 0.9, y: 10 }}
-                  animate={{ opacity: 1, scale: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.9, y: 10 }}
-                  className="bg-red-50 border border-red-100 p-6 rounded-3xl flex items-center gap-4 text-red-600"
-                >
-                  <AlertCircle size={24} className="shrink-0" />
-                  <p className="text-xs font-black uppercase tracking-tight">{error}</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
+          {/* Status Messages */}
+          {success && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mt-6 p-4 bg-green-50 border border-green-100 rounded-xl flex items-center gap-3"
+            >
+              <CheckCircle2 className="text-green-500" size={20} />
+              <span className="text-sm font-medium text-green-700">{success}</span>
+            </motion.div>
+          )}
+
+          {error && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mt-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-center gap-3"
+            >
+              <AlertCircle className="text-red-500" size={20} />
+              <span className="text-sm font-medium text-red-700">{error}</span>
+            </motion.div>
+          )}
         </div>
       </motion.div>
     </motion.div>

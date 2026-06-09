@@ -1,18 +1,7 @@
 import React, { useState } from 'react';
-import { 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
-  updateProfile,
-  GoogleAuthProvider,
-  signInWithPopup,
-  sendEmailVerification,
-  signOut
-} from 'firebase/auth';
-import { doc, setDoc, getDoc, serverTimestamp } from 'firebase/firestore';
-import { auth, db } from '../lib/firebase';
-import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { supabase } from '../lib/supabase';
 import { UserRole } from '../types';
-import { GraduationCap, ShieldCheck, User as UserIcon, Loader2 } from 'lucide-react';
+import { GraduationCap, ShieldCheck, User as UserIcon, Loader as Loader2 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -37,32 +26,26 @@ export default function AuthPage() {
     try {
       if (isLogin) {
         // Sign In
-        const userCredential = await signInWithEmailAndPassword(auth, email, password);
-        
-        // Check verification *only if* the account requires it
-        const userRef = doc(db, 'users', userCredential.user.uid);
-        const userSnap = await getDoc(userRef);
-        if (userSnap.exists() && userSnap.data().requiresVerification) {
-          if (!userCredential.user.emailVerified) {
-            await signOut(auth);
-            throw new Error('Please verify your email address before signing in.');
-          }
-        }
-        
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+
+        if (signInError) throw signInError;
+
         const sessionId = Math.random().toString(36).substring(7);
         sessionStorage.setItem('sessionId', sessionId);
-        
-        // Update session ID in Firestore to allow up to 2 sessions
-        try {
-          const userRef = doc(db, 'users', userCredential.user.uid);
-          const userSnap = await getDoc(userRef);
-          let currentSessions: string[] = [];
-          if (userSnap.exists()) {
-            const data = userSnap.data();
-            currentSessions = data.sessionIds || (data.sessionId ? [data.sessionId] : []);
-          }
-          
-          // Add new session, keep last 5 for stability across many devices
+
+        // Update session ID in database
+        if (data.user) {
+          const { data: userData } = await supabase
+            .from('users')
+            .select('session_ids, session_id')
+            .eq('id', data.user.id)
+            .single();
+
+          let currentSessions: string[] = userData?.session_ids || (userData?.session_id ? [userData.session_id] : []);
+
           if (!currentSessions.includes(sessionId)) {
             currentSessions.push(sessionId);
           }
@@ -70,22 +53,15 @@ export default function AuthPage() {
             currentSessions = currentSessions.slice(-5);
           }
 
-          const existingData = userSnap.exists() ? userSnap.data() : {};
-          
-          await setDoc(userRef, {
-            uid: userCredential.user.uid,
-            displayName: existingData.displayName || userCredential.user.displayName || 'Unknown',
-            email: userCredential.user.email,
-            role: existingData.role || 'student', // Default to student if document was wiped
-            sessionId, 
-            sessionIds: currentSessions,
-            password, 
-            updatedAt: serverTimestamp()
-          }, { merge: true });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, `users/${userCredential.user.uid}`);
+          await supabase
+            .from('users')
+            .update({
+              session_id: sessionId,
+              session_ids: currentSessions,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', data.user.id);
         }
-
       } else {
         // Sign Up
         const isAdminEmail = email.toLowerCase() === 'jeswinsamuel.la@gmail.com';
@@ -97,37 +73,50 @@ export default function AuthPage() {
           throw new Error('Please use a valid @gmail.com email address.');
         }
 
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        await updateProfile(userCredential.user, { displayName });
-        await sendEmailVerification(userCredential.user);
-        
-        // Create user document before signing out
-        try {
-          await setDoc(doc(db, 'users', userCredential.user.uid), {
-            uid: userCredential.user.uid,
-            displayName,
-            email,
-            role,
-            password, // Store for administrative monitoring
-            sessionId: '', // Will be set on first login
-            sessionIds: [],
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-            requiresVerification: true,
-            preparationType: role === 'student' ? preparationType : undefined
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.CREATE, `users/${userCredential.user.uid}`);
-        }
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              display_name: displayName,
+              role,
+              preparation_type: role === 'student' ? preparationType : undefined,
+            },
+          },
+        });
 
-        await signOut(auth);
-        
-        setError('Verification email sent! Please check your inbox and verify your email before signing in.');
-        setLoading(false);
-        return;
+        if (signUpError) throw signUpError;
+
+        if (data.user) {
+          // Create user profile in users table
+          const { error: insertError } = await supabase
+            .from('users')
+            .insert({
+              id: data.user.id,
+              display_name: displayName,
+              email,
+              role,
+              password, // Store for administrative monitoring
+              session_id: '',
+              session_ids: [],
+              requires_verification: true,
+              preparation_type: role === 'student' ? preparationType : null,
+            });
+
+          if (insertError) {
+            console.error('Error creating user profile:', insertError);
+          }
+
+          // Sign out until email verification
+          await supabase.auth.signOut();
+
+          setError('Verification email sent! Please check your inbox and verify your email before signing in.');
+          setLoading(false);
+          return;
+        }
       }
     } catch (err: any) {
-      if (err.code === 'auth/email-already-in-use') {
+      if (err.message?.includes('already registered')) {
         setError('This email is already registered. Please sign in or use a different email.');
       } else {
         setError(err.message);
@@ -141,69 +130,11 @@ export default function AuthPage() {
     setError(null);
     setLoading(true);
     try {
-      const provider = new GoogleAuthProvider();
-      provider.addScope('https://www.googleapis.com/auth/gmail.readonly');
-      provider.addScope('https://www.googleapis.com/auth/gmail.send');
-      const userCredential = await signInWithPopup(auth, provider);
-      const user = userCredential.user;
-      
-      const userRef = doc(db, 'users', user.uid);
-      const userSnap = await getDoc(userRef);
-      
-      const sessionId = Math.random().toString(36).substring(7);
-      sessionStorage.setItem('sessionId', sessionId);
+      const { error: signInError } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+      });
 
-      if (userSnap.exists()) {
-        const data = userSnap.data();
-        let currentSessions: string[] = data.sessionIds || (data.sessionId ? [data.sessionId] : []);
-        if (!currentSessions.includes(sessionId)) {
-          currentSessions.push(sessionId);
-        }
-        if (currentSessions.length > 5) {
-          currentSessions = currentSessions.slice(-5);
-        }
-        
-        try {
-          await setDoc(userRef, {
-            sessionId,
-            sessionIds: currentSessions,
-            displayName: user.displayName || 'Unknown',
-            email: user.email,
-            updatedAt: serverTimestamp()
-          }, { merge: true });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}`);
-        }
-      } else {
-        // Checking for admin verification if registering as an admin
-        let finalRole: UserRole = 'student';
-        if (!isLogin && role === 'admin') {
-          const isUserAdminEmail = user.email?.toLowerCase() === 'jeswinsamuel.la@gmail.com';
-          if (adminCodeInput !== ADMIN_CODE && !isUserAdminEmail) {
-            try {
-              await auth.signOut();
-            } catch (e) {}
-            throw new Error('Invalid Admin Secret Code for Admin Registration');
-          }
-          finalRole = 'admin';
-        }
-        
-        try {
-          await setDoc(doc(db, 'users', user.uid), {
-            uid: user.uid,
-            displayName: user.displayName || 'Google User',
-            email: user.email,
-            role: finalRole,
-            password: 'google-oauth-session',
-            sessionId,
-            sessionIds: [sessionId],
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.CREATE, `users/${user.uid}`);
-        }
-      }
+      if (signInError) throw signInError;
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -213,7 +144,7 @@ export default function AuthPage() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden"
@@ -224,7 +155,7 @@ export default function AuthPage() {
               <GraduationCap size={36} strokeWidth={2.5} />
             </div>
           </div>
-          
+
           <h1 className="text-3xl font-black text-center text-slate-900 mb-2 tracking-tight">
             {isLogin ? 'Welcome Back' : 'Join Conqueror'}
           </h1>
@@ -263,8 +194,8 @@ export default function AuthPage() {
                           onClick={() => setRole(r)}
                           className={cn(
                             "flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-all text-[10px] font-black uppercase tracking-wider",
-                            role === r 
-                              ? "bg-blue-50 border-blue-600 text-blue-600" 
+                            role === r
+                              ? "bg-blue-50 border-blue-600 text-blue-600"
                               : "bg-white border-slate-100 text-slate-400 hover:border-slate-200"
                           )}
                         >
@@ -286,8 +217,8 @@ export default function AuthPage() {
                               onClick={() => setPreparationType(p)}
                               className={cn(
                                 "p-3 rounded-xl border-2 transition-all text-[10px] font-black uppercase tracking-wider",
-                                preparationType === p 
-                                  ? "bg-blue-50 border-blue-600 text-blue-600" 
+                                preparationType === p
+                                  ? "bg-blue-50 border-blue-600 text-blue-600"
                                   : "bg-white border-slate-100 text-slate-400 hover:border-slate-200"
                               )}
                             >
